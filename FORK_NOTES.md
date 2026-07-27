@@ -36,12 +36,23 @@ bash sync-upstream.sh --no-push  # 只在本地合并，不推送
 ## 本地编译
 
 ```bash
-# 首次：生成本地自签名证书（"Local Self-Signed"，已生成过则跳过）
-bash scripts/codesign/setup_local.sh
-
 # 编译 Release（产物在 DerivedData/Build/Products/Release/AltTab.app）
 xcodebuild -project alt-tab-macos.xcodeproj -scheme Release -derivedDataPath DerivedData
+
+# 或一键脚本（会写 build.log 和 .build-done / .build-failed 标记）
+bash build-fork.sh
 ```
+
+**前置：签名证书。** 上游 release.xcconfig 硬编码了原作者的证书，本机用
+`config/local.xcconfig`（已被 .gitignore，不会进仓库）覆盖成函林自己的证书：
+
+```
+CODE_SIGN_IDENTITY = Developer ID Application: hanlin luo (QRT4DDQ77F)
+OTHER_CODE_SIGN_FLAGS = --deep --options runtime   // 去掉 --timestamp（代理下连不上苹果时间戳服务器）
+```
+
+如果换了机器/证书，重写这个文件即可；或运行 `bash scripts/codesign/setup_local.sh`
+生成 "Local Self-Signed" 自签名证书并把 CODE_SIGN_IDENTITY 改成它。
 
 要求：Xcode（已在用 26.6）、Swift 5.8 语法、部署目标 macOS 10.13。
 

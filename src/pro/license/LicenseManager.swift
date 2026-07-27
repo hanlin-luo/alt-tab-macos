@@ -175,24 +175,11 @@ class LicenseManager {
 
     // [FORK-PATCH] hanlin-luo fork: always report an active Pro license so every
     // Pro feature (search, styles, auto-size, extra shortcuts) is unlocked locally.
-    // This short-circuits trial/expiration/remote-validation logic below.
-    // Keep this block at the TOP of computeState() when merging upstream changes.
+    // The original keychain/trial/remote-validation body was REMOVED (kept only
+    // upstream) because Swift errors on unreachable code. When merging upstream,
+    // keep computeState() as just `return .pro`.
     func computeState() -> LicenseState {
-        let forkUnlockPro = true // [FORK-PATCH] unconditional Pro unlock
-        if forkUnlockPro { return .pro }
-        if keychain.value(account: Self.keychainKeyAccount) != nil {
-            let lastValidationResult = defaults.bool(forKey: "lastValidationResult")
-            guard lastValidationResult else { return .trialExpired }
-            if let variant = keychain.value(account: Self.keychainVariantAccount),
-               let maxVersion = Self.versionLimitedVariants[variant] {
-                let currentVersion = currentAppVersion()
-                if currentVersion.compare(maxVersion, options: .numeric) == .orderedDescending {
-                    return .proExpired
-                }
-            }
-            return .pro
-        }
-        return computeTrialState()
+        .pro // [FORK-PATCH] unconditional Pro unlock
     }
 
     private func computeTrialState() -> LicenseState {

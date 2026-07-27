@@ -43,16 +43,25 @@ xcodebuild -project alt-tab-macos.xcodeproj -scheme Release -derivedDataPath Der
 bash build-fork.sh
 ```
 
-**前置：签名证书。** 上游 release.xcconfig 硬编码了原作者的证书，本机用
-`config/local.xcconfig`（已被 .gitignore，不会进仓库）覆盖成函林自己的证书：
+**前置：签名与版本号。** 上游 release.xcconfig 硬编码了原作者的证书，本机用
+`config/local.xcconfig`（已被 .gitignore，不会进仓库）覆盖：
 
 ```
-CODE_SIGN_IDENTITY = Developer ID Application: hanlin luo (QRT4DDQ77F)
-OTHER_CODE_SIGN_FLAGS = --deep --options runtime   // 去掉 --timestamp（代理下连不上苹果时间戳服务器）
+CODE_SIGN_IDENTITY = Local Self-Signed        // scripts/codesign/setup_local.sh 生成的自签名证书
+OTHER_CODE_SIGN_FLAGS = --deep --timestamp=none
+ENABLE_HARDENED_RUNTIME = NO
+CURRENT_PROJECT_VERSION = 11.4.3              // 与上游最新 tag 保持一致
 ```
 
-如果换了机器/证书，重写这个文件即可；或运行 `bash scripts/codesign/setup_local.sh`
-生成 "Local Self-Signed" 自签名证书并把 CODE_SIGN_IDENTITY 改成它。
+两个关键教训（都是实测踩出来的）：
+
+1. **不要用真实 Developer ID 证书签本地版**：未公证的 Developer ID 应用会被
+   LaunchServices **静默拒绝**（双击/右键打开都无响应、无弹窗）。自签名证书无此问题，
+   且同一证书重编译后 TCC 权限（辅助功能/屏幕录制）不用重授。
+2. **必须注入版本号**：Info.plist 里 `CFBundleVersion` 来自 `$(CURRENT_PROJECT_VERSION)`，
+   上游靠 CI 注入；缺了它编译产物不含版本键，`App.swift` 强制解包直接 SIGTRAP 闪退。
+   `build-fork.sh` 会自动取最新 git tag 注入（`xcodebuild CURRENT_PROJECT_VERSION=x.y.z`），
+   无需手动维护。
 
 要求：Xcode（已在用 26.6）、Swift 5.8 语法、部署目标 macOS 10.13。
 

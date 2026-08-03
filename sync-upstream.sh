@@ -56,7 +56,7 @@ else
     echo " MERGE CONFLICT — upstream touched code near the fork patch."
     echo " Resolve manually:"
     echo "   1. Edit conflicted files (look for [FORK-PATCH] markers)"
-    echo "   2. Keep:  let forkUnlockPro = true / if forkUnlockPro { return .pro }"
+    echo "   2. Keep:  computeState() body as just '.pro // [FORK-PATCH] unconditional Pro unlock'"
     echo "   3. git add <files> && git merge --continue"
     echo "   4. Re-run this script"
     echo "=============================================================="
@@ -69,7 +69,10 @@ PATCH_FILE="src/pro/license/LicenseManager.swift"
 if ! grep -q "FORK-PATCH" "$PATCH_FILE"; then
   fail "unlock patch LOST after merge — $PATCH_FILE no longer contains [FORK-PATCH]. Restore it before pushing!"
 fi
-if ! grep -q "if forkUnlockPro { return .pro }" "$PATCH_FILE"; then
+# Patch form: computeState() is a single-expression `.pro // [FORK-PATCH] unconditional Pro unlock`
+# (the older `if forkUnlockPro { return .pro }` form was replaced in 39e2ccfe because
+# SWIFT_TREAT_WARNINGS_AS_ERRORS turns constant-folded unreachable code into a build error).
+if ! grep -qF ".pro // [FORK-PATCH] unconditional Pro unlock" "$PATCH_FILE"; then
   fail "unlock logic changed unexpectedly in $PATCH_FILE — review before pushing!"
 fi
 log "unlock patch verified in $PATCH_FILE"

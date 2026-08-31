@@ -43,6 +43,12 @@ xcodebuild -project alt-tab-macos.xcodeproj -scheme Release -derivedDataPath Der
 bash build-fork.sh
 ```
 
+脚本已内置 `-IDEPackageSupportDisableManifestSandbox=1
+-IDEPackageSupportDisablePluginExecutionSandbox=1`：受限环境（Agent 沙箱/容器）里
+SwiftPM 的 manifest 编译沙箱无法嵌套，会报 `sandbox-exec: sandbox_apply: Operation
+not permitted`，这两个 flag 是唯一有效解法（`-disableAutomaticPackageResolution`、
+`-skipPackageUpdates` 都无效）。
+
 **前置：签名与版本号。** 上游 release.xcconfig 硬编码了原作者的证书，本机用
 `config/local.xcconfig`（已被 .gitignore，不会进仓库）覆盖：
 

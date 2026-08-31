@@ -12,7 +12,14 @@ version=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
 version=${version:-0.0.0}
 echo "== AltTab fork build started: $(date), version $version ==" | tee build.log
 
+# IDEPackageSupport* flags: SwiftPM compiles Package.swift manifests inside a
+# sandbox-exec seatbelt profile, which cannot nest when xcodebuild itself runs
+# under a restrictive environment (agent sandbox, containers) — it fails with
+# "sandbox-exec: sandbox_apply: Operation not permitted" during Resolve Package
+# Graph. Disabling the manifest/plugin sandboxes is the only working workaround
+# (-disableAutomaticPackageResolution and -skipPackageUpdates do NOT help).
 xcodebuild -project alt-tab-macos.xcodeproj -scheme Release -derivedDataPath DerivedData \
+  -IDEPackageSupportDisableManifestSandbox=1 -IDEPackageSupportDisablePluginExecutionSandbox=1 \
   CURRENT_PROJECT_VERSION="$version" 2>&1 | tee -a build.log | tail -5
 status=${PIPESTATUS[0]}
 

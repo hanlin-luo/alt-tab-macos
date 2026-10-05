@@ -49,7 +49,11 @@ class KeyRepeatTimer {
     private static func startTimerForRepeatingKey(_ atShortcut: ATShortcut, _ block: @escaping () -> Void) {
         guard timerIsSuspended && atShortcut.state != .up && (atShortcut.scope == .local || !holdModifierIsReleased()) else { return }
         currentTimerShortcutName = atShortcut.id
-        // reading these user defaults every time guarantees we have the latest value, if the user has updated those
+        // The fallbacks are macOS's own defaults, for a machine that has never had these set. They are NOT
+        // what a user with custom key-repeat settings should get: `CachedUserDefaults.globalString` used to
+        // return nil on its first read, so every launch's first hold-cycle ran at these instead.
+        // Read per arm, but served from the cache after the first time, so a change made in System Settings
+        // mid-session isn't picked up until relaunch.
         let repeatRate = ticksToSeconds(CachedUserDefaults.globalString("KeyRepeat") ?? "6")
         let initialDelay = ticksToSeconds(CachedUserDefaults.globalString("InitialKeyRepeat") ?? "25")
         armedAt = ProcessInfo.processInfo.systemUptime
@@ -77,7 +81,9 @@ class KeyRepeatTimer {
     private static func handleEvent(_ atShortcut: ATShortcut, _ block: @escaping () -> Void) {
         let firedAt = ProcessInfo.processInfo.systemUptime
         DispatchQueue.main.async {
-            if atShortcut.state == .up || (atShortcut.scope == .global && holdModifierIsReleased()) {
+            if KeyRepeatTimerTestable.shouldStop(shortcutIsUp: atShortcut.state == .up,
+                keyIsPhysicallyDown: keyIsPhysicallyDown(atShortcut),
+                holdModifierIsReleased: atShortcut.scope == .global && holdModifierIsReleased()) {
                 stopTimerForRepeatingKey(atShortcut.id)
                 return
             }
@@ -103,6 +109,12 @@ class KeyRepeatTimer {
     private static func scheduleNextTick(_ shortcutName: String) {
         guard !timerIsSuspended, currentTimerShortcutName == shortcutName else { return }
         scheduleTick(currentRepeatRate)
+    }
+
+    /// nil for a modifier-only shortcut, which has no key of its own to read.
+    private static func keyIsPhysicallyDown(_ atShortcut: ATShortcut) -> Bool? {
+        guard atShortcut.shortcut.keyCode != .none else { return nil }
+        return CGEventSource.keyState(.hidSystemState, key: CGKeyCode(atShortcut.shortcut.carbonKeyCode))
     }
 
     /// Poll hardware modifier state to detect key release even when the event-based state update is delayed

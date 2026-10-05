@@ -3,11 +3,14 @@
 One engine decides which window the user is looking at: `AttentionModel`, fed by `AttentionDriver`, driven by
 `AttentionEngine`. There is no second engine, no mode, and no runtime switch.
 
+The order is where the rule is enforced, but it binds every statement AltTab makes about where the user is:
+the drawn list, which tile is preselected, what a tile says. Reading it as "the stored order only" is what
+lets AltTab's own request back in through some other surface.
+
 ## The whole system, in one place
 
     NSWorkspace activation ─┐
-    AltTab's own switch ────┼─→ TrackedWindowStateBridge.dispatch ─→ AttentionEngine.dispatched ─┐
-    factless kAXFocusedWindow read ┘                                                              │
+    kAXFocusedWindow reads ─┴─→ TrackedWindowStateBridge.dispatch ─→ AttentionEngine.dispatched ─┐
                                                                                                  │
     the app's AXObserver ─→ AxObserverRegistry ─→ AttentionEngine.axSemanticFocus (60ms settle) ─┤
                                                                                                  │
@@ -33,8 +36,17 @@ one-window-per-app representation consume this statement. Unknown is never inter
 
 ## Who may write the order
 
-- **an attention decision** — a click naming its target, AltTab's own switch, or an app answering which of
-  its windows it considers focused (including Cmd+`). The only source that may claim the user moved.
+- **an attention decision** — a click naming its target, or an app answering which of its windows it
+  considers focused (including Cmd+`). The only source that may claim the user moved.
+- **not AltTab's own switch.** Picking a tile asks the OS to focus a window; the order moves when the OS
+  reports that it did (the activation, then the app's answer or the read made after the focus operation).
+  A focus that did not take would otherwise leave the order claiming a window the user never reached, and
+  nothing corrects that: the app that kept focus emits nothing (#6055,
+  `testAFocusThatDidNotTakeLeavesTheFrontAlone`). The activation it provokes is not a way back in either: it
+  names an app, and that app's cached answer is about the window being LEFT, so while AltTab is still
+  awaiting the read it made after the operation, the activation moves nothing and the read is what moves it.
+  An app that never answers that read therefore keeps the last confirmed front, which is the degradation
+  boundary below rather than an exception to it.
 - **a structural repair** — the front window closed and something has to take its place, or a tab group
   changed which member it draws. Not a claim about the user at all.
 
@@ -56,7 +68,7 @@ those mechanisms, but cannot by itself create or dissolve that group.
 ## Where the decision lands
 
 Inside the same dispatch that produced it (`TrackedWindowStateBridge.dispatch`). A decision deferred to the
-next runloop turn would let the switcher draw one frame with the old order first, which the QA matrix scores
+next runloop turn would let the switcher draw one frame with the old order first, which is scored
 as "right, but late" rather than right.
 
 A decision naming an already-represented window checks its cached process owner before committing; this is
@@ -89,7 +101,7 @@ the only arbitration delay in the attention path. The AX answer's process genera
 are captured before that delay; the timer changes commit time, never evidence order. Thus an exact click
 arriving while AX settles remains newer when the timer fires. Widening the settle is not free: it delays
 every genuine switch by the same amount, against a measured floor of 219ms for the fastest human action ever captured.
-Raises spaced wider than the settle commit separately and #5974's shape returns; QA watches that limit
+Raises spaced wider than the settle commit separately and #5974's shape returns; the live runs watch that limit
 in amber rather than asserting it away.
 
 The factless-activation read has a separate 250ms messaging timeout. It is a blocking-IPC safety bound, not

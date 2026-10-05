@@ -5,14 +5,13 @@ attention decisions that were committed and refused. It is written after decisio
 recorder that owns nothing — the deciding is `AttentionEngine`'s (`AttentionOrderSpecs.md`). Switching
 telemetry off cannot change what AltTab does.
 
-The QA harness is the consumer: `--qa-state` reads `summary`, and `--qa-telemetry` drains the ring as NDJSON.
+Both consumers are CLI: `--qa-state` reads `summary`, `--qa-telemetry` drains the ring.
 
 ## Record schema
 
 - every record carries `v`, `seq`, `at` and `kind`; every other field is optional and omitted when unset
 - sequence numbers are monotonic and never reused, so a drained batch stitches onto the previous one
 - the field set is closed and carries no window title, keystroke or document name
-- NDJSON lines sort their keys, so two runs diff cleanly
 
 ## Ring buffer
 
@@ -23,7 +22,7 @@ The QA harness is the consumer: `--qa-state` reads `summary`, and `--qa-telemetr
 ## Attention
 
 - a committed decision records the pid, wid, process generation, source, reason code and status
-- `source` is the CHANNEL that named the window (`workspace`, `altTab`, `accessibility`, `annotatedSession`),
+- `source` is the CHANNEL that named the window (`workspace`, `accessibility`, `annotatedSession`),
   so a disagreement is attributable to one of them rather than to "focus" in general
 - `lastAttention` always reflects the most recent COMMITTED decision — a refusal is recorded as its own event
   rather than overwriting it, because a reader asking "where does the model think the user is" is not helped

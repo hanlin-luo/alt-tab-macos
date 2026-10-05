@@ -104,12 +104,6 @@ extension AXUIElement {
         try Self.onCorrectThread(pid: pid) { try cgWindowId() }
     }
 
-    func pid() throws -> pid_t {
-        var pid = pid_t(0)
-        try throwIfNotSuccess(AXUIElementGetPid(self, &pid))
-        return pid
-    }
-
     /// A direct liveness probe for the window behind this element. Returns the raw `AXError` so the caller can
     /// tell a DEAD element (`.invalidUIElement` — the window was closed/destroyed) apart from a merely
     /// UNRESPONSIVE app (`.cannotComplete` — retry later) or a live one (`.success`). Reads `kAXRole`, the
@@ -141,7 +135,6 @@ extension AXUIElement {
             case kAXMainAttribute: result.isMain = castSafely(value)
             case kAXIsApplicationRunningAttribute: result.appIsRunning = castSafely(value)
             case kAXURLAttribute: result.url = castSafely(value)
-            case kAXParentAttribute: result.parent = castSafely(value)
             case kAXFocusedWindowAttribute: result.focusedWindow = castSafely(value)
             case kAXMainWindowAttribute: result.mainWindow = castSafely(value)
             case kAXCloseButtonAttribute: result.closeButton = castSafely(value)
@@ -158,6 +151,25 @@ extension AXUIElement {
     /// pid-aware variant of `attributes(_:)` — routes the own-process read to main. See `onCorrectThread(pid:_:)`.
     func attributes(_ keys: [String], pid: pid_t) throws -> AXAttributes {
         try Self.onCorrectThread(pid: pid) { try attributes(keys) }
+    }
+
+    private func walkChildren(pageSize: Int, pid: pid_t, mayRead: () -> Bool,
+                              visit: (AXUIElement) -> Bool?) -> AxChildrenTraversal.Result {
+        AxChildrenTraversal.walk(pageSize: pageSize, mayRead: mayRead, count: {
+            Self.onCorrectThread(pid: pid) {
+                var count: CFIndex = 0
+                guard AXUIElementGetAttributeValueCount(self, kAXChildrenAttribute as CFString, &count) == .success,
+                      count >= 0 else { return nil }
+                return Int(count)
+            }
+        }, page: { offset, amount in
+            Self.onCorrectThread(pid: pid) {
+                var values: CFArray?
+                guard AXUIElementCopyAttributeValues(self, kAXChildrenAttribute as CFString, offset, amount, &values) == .success,
+                      let elements = values as? [AXUIElement] else { return nil }
+                return elements
+            }
+        }, visit: visit)
     }
 
     func castSafely<T>(_ value: CFTypeRef) -> T? {
@@ -211,8 +223,6 @@ extension AXUIElement {
     /// windows can have high, sparse ids, so TIME — not an id ceiling — is the real bound; a monotonic
     /// `LightweightTimer` (checked every iteration) makes it reliable. Shared so every brute-force is capped the
     /// same way. These run on the isolated AX scan pool (`scan: true`), off the main thread.
-    static let bruteForceBudgetMs: Double = 250
-
     /// Build an element per AXUIElementID for `pid` from a remote token (`_AXUIElementCreateWithRemoteToken` —
     /// the only way to reach elements the app omits from `kAXWindows`, including other-Space windows and
     /// inactive OS tabs) and hand it to `inspect`, until `inspect` returns true or the budget elapses.
@@ -226,7 +236,7 @@ extension AXUIElement {
     /// never reaches — the same scan adopted 57 in an earlier run where they happened to sit lower.
     @discardableResult
     private static func bruteForceElements(_ pid: pid_t, from startId: AXUIElementID = 0,
-                                           _ inspect: (AXUIElement) -> Bool) -> AXUIElementID {
+                                           _ inspect: (AXUIElement, () -> Bool) -> Bool) -> AXUIElementID {
         // 20 bytes: pid (4) + 0 (4) + magic 0x636f636f "coco" (4) + AXUIElementID (8); byte order matters.
         // ONE mutable CFData for the whole sweep, with only the id field rewritten in place. Building a fresh
         // `Data` per field and bridging it to `CFData` per candidate allocated twice per iteration, and this
@@ -244,16 +254,11 @@ extension AXUIElement {
         var magic = Int32(0x636f636f)
         memcpy(bytes + 8, &magic, 4)
         let timer = LightweightTimer()
-        for axUiElementId: AXUIElementID in startId..<AXUIElementID.max {
-            var idField = axUiElementId
+        return AxTraversalPolicy.scan(from: startId, elapsedMs: { timer.elapsedMilliseconds }, candidate: { id in
+            var idField = id
             memcpy(bytes + 12, &idField, 8)
-            if let candidate = _AXUIElementCreateWithRemoteToken(remoteToken)?.takeRetainedValue(),
-               inspect(candidate) {
-                return axUiElementId + 1
-            }
-            if timer.hasElapsed(milliseconds: bruteForceBudgetMs) { return axUiElementId + 1 }
-        }
-        return AXUIElementID.max
+            return _AXUIElementCreateWithRemoteToken(remoteToken)?.takeRetainedValue()
+        }, inspect: inspect)
     }
 
     /// Resolve every requested other-Space wid in ONE AXUIElementID traversal. The inventory knows all of a
@@ -269,8 +274,9 @@ extension AXUIElement {
         var remaining = wids
         var found = [CGWindowID: AXUIElement]()
         found.reserveCapacity(wids.count)
-        bruteForceElements(pid) { candidate in
-            guard let wid = try? candidate.cgWindowId(), remaining.contains(wid) else { return false }
+        bruteForceElements(pid) { candidate, mayStartIpc in
+            guard mayStartIpc(), let wid = try? candidate.cgWindowId(), remaining.contains(wid), mayStartIpc()
+                else { return false }
             let role = (try? candidate.attributes([kAXRoleAttribute]))?.role
             guard BruteForceWindowMatch.isTargetWindowRoot(candidateWid: wid, candidateRole: role, targetWid: wid) else { return false }
             found[wid] = candidate
@@ -299,10 +305,12 @@ extension AXUIElement {
                                              -> (found: [(CGWindowID, AXUIElement, String)], nextId: AXUIElementID) {
         var seen = Set<CGWindowID>()
         var result = [(CGWindowID, AXUIElement, String)]()
-        let nextId = bruteForceElements(pid, from: startId) { candidate in
-            guard let wid = try? candidate.cgWindowId(), wid != 0, !excluding.contains(wid), !seen.contains(wid),
+        let titleSet = Set(titles)
+        let nextId = bruteForceElements(pid, from: startId) { candidate, mayStartIpc in
+            guard mayStartIpc(), let wid = try? candidate.cgWindowId(), wid != 0,
+                  !excluding.contains(wid), !seen.contains(wid), mayStartIpc(),
                   let a = try? candidate.attributes([kAXSubroleAttribute, kAXTitleAttribute]),
-                  a.subrole == kAXStandardWindowSubrole, let title = a.title, titles.contains(title) else { return false }
+                  a.subrole == kAXStandardWindowSubrole, let title = a.title, titleSet.contains(title) else { return false }
             seen.insert(wid)
             result.append((wid, candidate, title))
             return result.count >= titles.count
@@ -329,9 +337,13 @@ extension AXUIElement {
         try throwIfNotSuccess(AXUIElementPerformAction(self, action as CFString))
     }
 
-    /// Query the window's AXTabGroup child to detect OS-level tabs.
-    /// Returns tab titles if the window has tabs (always ≥ 2), nil otherwise.
-    /// `children` should come from the prior `.attributes([..., kAXChildrenAttribute])` call.
+    private static let tabGroupDirectChildPageSize = 64
+    private static let tabButtonPageSize = 128
+    private static let tabGroupTraversalBudgetMs: Double = 250
+
+    /// Query the window's AXTabGroup child to detect OS-level tabs. Foreign AX arrays use bounded pages;
+    /// an incomplete page, failed child read, or expired traversal is `.unknown`, never `.standalone`, because
+    /// silence from a partial tree must not dissolve a group the app did not actually deny.
     ///
     /// **DIRECT children only, deliberately, and fullscreen windows are therefore not read here.** A
     /// fullscreen window's tab bar is reachable — probed at length — but only unevenly: Finder and Script
@@ -346,25 +358,35 @@ extension AXUIElement {
     /// geometry path's job: a fullscreen Space holds one window and its tabs, so the Space invariant plus
     /// Space-less-ness already identifies them.
     /// Returns the tab TITLES and the group's own identity (`TabGroupToken`), which is the `AXTabGroup`
-    /// element's `AXUIElementID`. The element was already in hand here and used to be discarded; every
-    /// window of a group hands out the same one while it is the selected tab, so it is a membership fact the
-    /// titles can only guess at. The BUTTONS are deliberately not kept: they are rebuilt by ordinary tab
+    /// element's `AXUIElementID`. Every window of a group hands out the same one while it is the selected
+    /// tab, so the token is a membership fact the titles can only guess at. The BUTTONS are deliberately not kept: they are rebuilt by ordinary tab
     /// operations (Finder rebuilds all of them on one Cmd+T) and each reports the SELECTED window's wid
     /// rather than its own, so a button is neither stable nor self-naming. Measured on Finder, Terminal and
     /// TextEdit.
-    static func tabGroupInfo(_ children: [AXUIElement]?) -> (titles: [String], token: TabGroupToken?)? {
-        guard let children else { return nil }
-        for child in children {
-            let a = try? child.attributes([kAXRoleAttribute, kAXChildrenAttribute])
-            guard a?.role == "AXTabGroup", let tabChildren = a?.children else { continue }
-            let titles = tabChildren.compactMap { tab -> String? in
-                let t = try? tab.attributes([kAXSubroleAttribute, kAXTitleAttribute])
-                guard t?.subrole == "AXTabButton" else { return nil }
-                return t?.title ?? ""
+    func tabGroupObservation(pid: pid_t) -> TabGroupObservation {
+        let timer = LightweightTimer()
+        let mayRead = { !timer.hasElapsed(milliseconds: Self.tabGroupTraversalBudgetMs) }
+        var observation = TabGroupObservation.unknown
+        var complete = true
+        let result = walkChildren(pageSize: Self.tabGroupDirectChildPageSize, pid: pid, mayRead: mayRead) { child in
+            guard let role = try? child.attributes([kAXRoleAttribute], pid: pid).role else {
+                complete = false
+                return false
             }
-            return titles.count >= 2 ? (titles, child.id()) : nil
+            guard role == "AXTabGroup" else { return false }
+            var titles = [String]()
+            let tabs = child.walkChildren(pageSize: Self.tabButtonPageSize, pid: pid, mayRead: mayRead) { tab in
+                guard let attributes = try? tab.attributes([kAXSubroleAttribute, kAXTitleAttribute], pid: pid)
+                    else { return nil }
+                if attributes.subrole == "AXTabButton" { titles.append(attributes.title ?? "") }
+                return false
+            }
+            if tabs == .complete {
+                observation = titles.count >= 2 ? .group(titles: titles, token: child.id()) : .standalone
+            }
+            return true
         }
-        return nil
+        return result == .complete && complete ? .standalone : observation
     }
 }
 
@@ -392,7 +414,6 @@ struct AXAttributes {
     var isMinimized: Bool?
     var isFullscreen: Bool?
     var isMain: Bool?
-    var parent: AXUIElement?
     var children: [AXUIElement]?
     var focusedWindow: AXUIElement?
     var mainWindow: AXUIElement?

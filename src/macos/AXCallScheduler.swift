@@ -6,10 +6,9 @@ import Foundation
 ///   2. don't hang on unresponsive apps — a call that times out is retried with backoff on a quarantine
 ///      pool, so one beach-balling app can't starve calls to the responsive ones.
 ///
-/// It does NOT throttle/coalesce. Coalescing self-flooding inputs (resize/move/title) is the job of an
-/// explicit `Throttler` at the call site (e.g. `Applications.windowAttributesThrottler`). The only
-/// dedup here is per-key in-flight: a second call for a key already running is held as `pendingBlock`
-/// and run once the current one finishes — never two concurrent calls for the same key.
+/// It does not delay calls against a guessed interval. Its per-key in-flight backpressure lets one call run
+/// while retaining only the latest pending request, so a slow target naturally admits fewer calls without
+/// making a responsive target wait — never two concurrent calls for the same key.
 ///
 /// **Per-key dedup is not enough to keep one app off a whole lane**, because keys are per-window: an app
 /// with 12 windows has 12 keys, and one wedged app could hold every worker of a 6-wide lane for the full 1s
@@ -18,7 +17,8 @@ import Foundation
 class AXCallScheduler {
     static let shared = AXCallScheduler()
 
-    // first-try: event-driven reads · scan: the bursty periodic inventory, isolated · retry: quarantine for timed-out apps
+    // first-try: event-driven reads · scan: the bursty periodic inventory · retry: quarantine for timed-out
+    // apps. Isolated from each other by width AND by QoS; see `init`.
     let axQueryFirstTryQueue: LabeledOperationQueue
     let axQueryScanQueue: LabeledOperationQueue
     let axQueryRetryQueue: LabeledOperationQueue
@@ -52,14 +52,24 @@ class AXCallScheduler {
         var cancelRetries = false
     }
 
+    /// **The three lanes are separated by QoS, not only by width.** An AX call is a synchronous Mach send,
+    /// and macOS donates the caller's QoS to the receiving process for the duration — so the QoS here does
+    /// not just order our own workers, it decides how fast the app on the other end answers us. Equal QoS
+    /// across the lanes therefore did NOT give the first-try lane the isolation its width implies: a bulk
+    /// scan asked every app to answer at the same priority as the read a summon was waiting on.
     private init() {
         // WindowServer now owns geometry/visibility/space reads (moved off these pools), so the event-read
         // first-try lane carries far less now (focus reads + element acquires); 8 is ample (was 10).
+        // The only lane a user is ever waiting on, and the donation is working FOR us here.
         axQueryFirstTryQueue = LabeledOperationQueue("axQueryFirstTry", .userInteractive, 8)
-        axQueryScanQueue = LabeledOperationQueue("axQueryScan", .userInteractive, 6)
+        // The bursty periodic inventory: below the event-read lane on purpose, which is what actually keeps
+        // it from starving a summon's reads.
+        axQueryScanQueue = LabeledOperationQueue("axQueryScan", .userInitiated, 6)
         // ...and the unresponsive-app retry lane sees fewer queries too; 6 is ample. Freed budget funds the
-        // wider cgsCall lane (B6).
-        axQueryRetryQueue = LabeledOperationQueue("axQueryRetry", .userInteractive, 6)
+        // wider cgsCall lane (B6). `.utility` because every call on it is a retry against an app that has
+        // already blown the 1s messaging timeout, on a 200ms-5s backoff: nobody is waiting on any one of
+        // them, and donating user-interactive to a wedged app only asks it to beach-ball at high priority.
+        axQueryRetryQueue = LabeledOperationQueue("axQueryRetry", .utility, 6)
     }
 
     /// Run an outgoing AX call, retrying with backoff if the app is unresponsive. `scan: true` routes the
@@ -84,13 +94,6 @@ class AXCallScheduler {
             keyStates[key] = state
             lock.unlock()
         }
-    }
-
-    /// `scan: true` routes to the isolated bursty-inventory pool instead of the event-read pool, so heavy
-    /// off-main work (e.g. the per-Space `windowsInSpaces` fan-out in `Applications.syncSpacesState`) can't
-    /// starve latency-critical focused-window reads.
-    func submit(scan: Bool = false, _ block: @escaping () -> Void) {
-        (scan ? axQueryScanQueue : axQueryFirstTryQueue).addOperation(block)
     }
 
     func removeEntry(key: String) {

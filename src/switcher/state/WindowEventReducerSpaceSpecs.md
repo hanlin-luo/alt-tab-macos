@@ -28,18 +28,17 @@ The reaction is therefore split by cost, and the split is what these tests hold 
   transition's window storm is churning, so an early answer is a wrong answer that has to be re-taken. They
   stay on the trailing edge.
 
-**The trap the first test guards.** The leading edge must NOT repaint. `App.refreshOpenUiAfterExternalEvent`
-is throttled at 200ms leading-edge, so a repaint fired the instant the Space flips SPENDS that edge, and the
-update that actually matters — the semantic focus answer following the Space change — then waits out the
-tail. Measured live with the switcher open across a transition: it pushed the MRU
-correction from 19ms to 220ms after the summon. It looks free and it is not.
+**The trap the first test guards.** The leading edge must NOT repaint. Painting the instant the Space flips
+draws the transition's window storm mid-churn: the per-window membership and the WindowServer re-query have
+not run, so the list is filtered and sorted against facts that are about to change, and the user watches it
+re-order under them. It looks free and it is not.
 
 ## Scenarios
 
 ### A. The leading edge is the topology read, and nothing else
 
 - **testSpaceTransitionStartedEmitsTheTopologyReadAlone** — `.spaceTransitionStarted` emits exactly
-  `[.refreshSpacesTopology]`: no repaint (the 200ms-throttle trap above), and none of the settled branch's
+  `[.refreshSpacesTopology]`: no repaint (the mid-churn trap above), and none of the settled branch's
   expensive work.
 - **testSpaceTransitionStartedTouchesNoWindowState** — the leading edge asks the shell to re-read the
   topology and writes nothing on the model itself, so the state it returns is byte-for-byte the one it got.
@@ -49,6 +48,11 @@ correction from 19ms to 220ms after the summon. It looks free and it is not.
 - **testSpaceChangeSettledKeepsMembershipAndTheStateRequery** — `.spaceChangeSettled` still emits the
   per-window Space sync, the WindowServer state re-query for every tracked window, the shortcut re-check and
   the repaint. Collapsing the two branches into one would either run this storm-time work early or lose it.
+- **testSpaceChangeSettledRecapturesOnlyWindowsOnVisibleSpaces** — the repaint asks to recapture only the
+  windows on a Space now on screen. Each capture costs the OS three signature validations in its permission
+  service, and recapturing every window on every switch was enough to exhaust it on a busy desktop and make
+  macOS ask for Screen Recording again (#6067). Windows elsewhere keep their thumbnail until focused or until
+  the switcher opens.
 
 ### C. Scope and completion are separate facts
 
@@ -89,7 +93,7 @@ reports a non-zero `spaceTypeMask` for one it places, and passes the contradicti
 
 ### E. A transition that never commits, and transitions that overlap
 
-Both shapes became reachable when the QA harness learned to synthesize a dock swipe. A commanded
+Both shapes became reachable once a dock swipe could be synthesized. A commanded
 `SLSManagedDisplaySetCurrentSpace` always commits and always finishes before the next one starts, so neither
 could be produced before, and neither was pinned.
 
@@ -107,7 +111,7 @@ in between, so this is not a no-op at the event layer, only at the answer layer.
   to back with no settle between them. The edge holds no per-transition state, so the second is exactly the
   first.
 
-Both have live counterparts in the QA suite: an abandoned swipe, and three overlapping swipes.
+Both have live counterparts: an abandoned swipe, and three overlapping swipes.
 
 ### F. Whole topology snapshots apply in issue order
 

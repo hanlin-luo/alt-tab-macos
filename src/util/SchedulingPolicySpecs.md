@@ -7,6 +7,9 @@ testable without real clocks or queues (same pattern as `SelectionResolver` / `A
 
 - **`ThrottleDecision`** — for one `throttleOrProceed` call: run on the leading edge, or (within the
   window) schedule a single trailing run and coalesce the rest. Used by `Throttler` and `ThrottlerWithKey`.
+- **`RepaintCoalescingPolicy`** — when the open switcher repaints after an external event: a trailing
+  edge one frame out that the whole burst collapses into, then a quiet period derived from what the paint
+  actually cost. Used by `RepaintCoalescer`, which `App.refreshOpenUiAfterExternalEvent` owns.
 - **`RetryPolicy`** — backoff schedule (200ms → 1s → 2s → 5s, then 5s) and the 60s give-up, for retrying
   an AX call against an unresponsive app. Used by `AXCallScheduler`.
 - **`SurfaceAcquisitionPolicy`** — may the inventory sweep spend another brute-force acquisition on a
@@ -29,6 +32,38 @@ Mirrors `SchedulingPolicyTests.swift` 1:1.
 - **testThrottleClockGoingBackwardsRunsNow** — now < last (monotonic-clock guard) → `runNow`.
 - **testThrottleBurstCoalescesAfterOneTail** — a burst yields one leading run, one `scheduleTail`, then `coalesce` for the rest.
 
+### A1. ThrottleSlot
+
+One key's throttle state, holding the work its pending tail will run. The tail runs the LATEST work offered:
+callers pass closures that carry values, so running the one that scheduled the tail applied a burst's second
+value and dropped its last. A window kept a stale title that way until something re-read it (#6047).
+
+- **testThrottleSlotTailRunsTheLatestWorkOfABurst** — A runs now, B schedules the tail, C and D coalesce, the tail runs D.
+- **testThrottleSlotTailRestartsTheWindow** — the tail counts as a run: the next call inside 200ms of it schedules a new tail.
+- **testThrottleSlotTailWithNothingPendingRunsNothing** — a tail with no work pending returns nil and leaves the window alone.
+- **testThrottleSlotLateTailCannotLandOlderWorkOverNewer** — a leading-edge run empties the slot, so a tail its queue ran late finds nothing.
+- **testThrottleSlotResetRestoresTheLeadingEdge** — a reset makes the next offer a leading edge again and drops the tail queued for the abandoned window.
+
+### A2. RepaintCoalescingPolicy
+
+A fresh request waits 16ms so a burst can merge before drawing. If the previous paint left a later quiet
+period, the request waits for that deadline instead. Quiet time is four times the measured paint cost,
+floored at 16ms and capped at 200ms. This targets one fifth of main-thread time until paint cost exceeds
+50ms; the ceiling then prioritizes freshness over the duty-cycle target. Main-queue stalls can delay any
+scheduled repaint beyond its deadline. Committed attention bypasses this delay because painting also
+reconciles the default selection that a modifier release commits.
+
+Measured over a QA pass (785 requests), trailing coalescing used 361 paints against 392 for leading-edge
+throttling. An app quitting with 34 windows emitted its destruction burst within 14ms. The scheduling
+behavior under delayed execution and reentrant requests is covered by `CoalescedWorkTests.swift`.
+
+- **testRepaintLoneRequestWaitsOneFrame** — a fresh request has a 16ms delay.
+- **testRepaintWaitsOutAFloorLeftByThePreviousPaint** — a later quiet-period deadline wins.
+- **testRepaintFloorInsideOneFrameStillWaitsAFullFrame** — a nearer deadline does not shorten merging.
+- **testRepaintQuietIsFourTimesTheMeasuredCost** — 21ms of work buys 84ms of quiet.
+- **testRepaintQuietFloorsAtOneFrame** — cheap paints still leave at least 16ms of quiet.
+- **testRepaintQuietCapsSoAPathologicalPaintCannotStarveTheSwitcher** — a 517ms paint buys 200ms of quiet.
+
 ### B. RetryPolicy
 - **testRetryBackoffSequence** — retry 0/1/2/3/4… → 200ms / 1s / 2s / 5s / 5s.
 - **testRetryBackoffClampsAndFloors** — counts past the last step clamp to 5s; negative counts floor to the first step.
@@ -39,7 +74,7 @@ Mirrors `SchedulingPolicyTests.swift` 1:1.
 
 The situation used to be recorded BEFORE the scan ran and then refused forever, so one fruitless attempt — the
 app's AX tree not ready yet, the classic at launch — permanently gave up on it, with no retry and no later
-trigger. Measured over a live QA run (2026-07-30): 82 tab reads named untracked tabs and the scan adopted
+trigger. Measured live (2026-07-30): 82 tab reads named untracked tabs and the scan adopted
 NOTHING, against 57 adoptions in a run whose first attempt happened to land. So the outcome is what gets
 recorded, and a situation gets a small budget instead of exactly one shot.
 
@@ -66,7 +101,7 @@ recorded, and a situation gets a small budget instead of exactly one shot.
   they are that window's tabs. Those are a find for a DIFFERENT requester, so stepping the shared cursor past
   them made two tab groups of one app permanently uncrossable — measured on a cold launch with Finder holding
   two 3-tab groups, each requester's sweep kept finding only the other's tabs and six tabs came back as the
-  two that were active (QA C-05). A deferred candidate rewinds the cursor onto itself; the attempt budget
+  two that were active (measured live). A deferred candidate rewinds the cursor onto itself; the attempt budget
   above still bounds the whole thing.
 
 ### D. SurfaceAcquisitionPolicy
@@ -87,6 +122,11 @@ this policy still bounds repeated batches whose unresolved members remain unchan
 its own event, and that path uses the cheap `kAXWindows` route with no brute-force, so refusing the sweep
 cannot make a window undiscoverable.
 
+**A window that changes nothing is the case this budget cannot judge alone**, and the caller owns that half:
+it records no failure reached while the screen is locked, and drops a process's records once it starts
+answering accessibility again. Without those, a wake wrote off every window AltTab did not already hold an
+element for, and a quiescent background app never moved its window set to earn another attempt (#6031).
+
 - **testAFreshSurfaceIsAlwaysAttempted** — a surface with no failure on record is swept, as before.
 - **testAFailedSurfaceIsRetriedWithinTheBudget** — a failure is not a verdict: the situation keeps its three
   attempts, because an app still building its accessibility tree at launch fails transiently.
@@ -95,3 +135,12 @@ cannot make a window undiscoverable.
   makes a previously-unreachable element reachable, so it restarts the budget however exhausted it was.
 - **testAttemptsResetOnANewSituation** — the counter is per situation, not cumulative, so a long-lived app
   that churns windows never accumulates its way into a permanent refusal.
+
+### E. Accessibility traversal
+
+`AxTraversalPolicy.scan` visits candidates within a 250ms slice, with no numeric ID or candidate ceiling.
+Callers that restart at zero can reach high, sparse IDs while time remains. If the deadline refuses an IPC,
+the resume cursor names that unfinished candidate. A completed inspection, including a missing private
+element, advances the cursor. Tests cover reaching ID 30,000 within budget, contiguous timed slices,
+expiration between window-id and role reads, expiration during construction, absent elements, and the end
+of the UInt64 id range.

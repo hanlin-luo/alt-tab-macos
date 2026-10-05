@@ -17,7 +17,9 @@ giving either source universal authority.
    The gate binds exact attention too, because an app key-focuses its own HUD through `kAXFocusedWindow`
    exactly as a real window does, so gating only discovery would delay the surface by one focus event.
 4. Exact attention makes a parentless, admissibly-placed surface a destination even when AX is absent or
-   unconventional, but it cannot override an auxiliary subrole or a role that is not a window.
+   unconventional, but it cannot override an auxiliary subrole or a role that is not a window. It never
+   refuses what discovery admits: Emacs 29.4 reports its frames as role `AXTextField` with subrole
+   `AXStandardWindow`, and they stay destinations when focused.
 5. Floating/system-dialog subroles are auxiliary. AppKit can mark a floating panel `kAXMain`; that does not
    turn the panel into a switch destination.
 6. A non-auxiliary AXWindow marked `kAXMain` is a destination.
@@ -37,6 +39,11 @@ parentage intentionally says nothing about them because both active and backgrou
 
 Window admission and application admission use the same evidence without conflating their permissions. Ordinary
 discovery still excludes XPC processes unless they are an established user-facing exception. Exact attention may
-admit the process which owns that destination; zombie status always rejects it. Owning an exact destination does not
+admit the process which owns that destination; zombie status always rejects it, and so does being the window
+manager (`com.apple.WindowManager`), which draws the wallpaper, the Stage Manager strip and the Mission Control
+overlays and owns no window a user can switch to. Owning an exact destination does not
 grant speculative placeholders: only regular apps get one. An accessory or prohibited process that briefly took
 focus (Raycast's palette, CoreServicesUIAgent's Gatekeeper alert) is not an app the user can switch back to.
+When WindowServer has already named a positive process id, that id remains the application's identity even if
+`NSRunningApplication.processIdentifier` reports `-1` (briefly during lifecycle notifications, or permanently for
+Xcode's Device Hub). Discovery without either positive id is ignored.

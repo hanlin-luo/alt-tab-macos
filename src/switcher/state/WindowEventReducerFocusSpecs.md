@@ -64,8 +64,9 @@ own any more — both were bursts of 815s and 808s, and neither event can reach 
 
 - **testAFocusEventCannotMoveTheOrder** / **testAnOrderInCannotMoveTheOrder** — an 808 and an 815 leave the
   order exactly as they found it.
-- **testCommittedAttentionMovesTheOrder** — a decision from `AttentionModel` is what moves it, and it requests
-  an immediate repaint so an open switcher does not spend the structural-event throttle before showing it.
+- **testCommittedAttentionMovesTheOrder** — a decision from `AttentionModel` moves the order and asks for
+  immediate selection reconciliation and painting. A modifier release can arrive before a trailing repaint;
+  it must not commit the stale default selection. Structural repairs retain the coalesced repaint path.
 - **testCommittedAttentionForAnUnknownWindowIsIgnored** — a decision naming a window nobody tracks is
   dropped, never fabricated into one.
 - **testAStructuralRepairStillWrites** — the other writer: not a claim about the user, so it is never gated.
@@ -87,6 +88,18 @@ own any more — both were bursts of 815s and 808s, and neither event can reach 
   its recorded `lastLeftSpaceId` proves the shared Space and carries the whole group to the destination.
 - **testSemanticFocusDoesNotCarryAHeldGroupFromAnotherSpace** — a held group whose recorded departure names
   another Space remains separate; timing and app identity alone cannot merge it.
+- **testSemanticFocusDoesNotCarryAHeldWindowThatCarriesNoGroup** — the held side must bring tab evidence of
+  its own; the hold is not any. A window ENTERING FULLSCREEN is held by accident (it goes Space-less while the
+  transition mints its own surfaces, which arms the recent-create hold), and the app then answers the
+  activation with its other window on the Space the held one just left — so every other clause passes and two
+  SEPARATE windows became one group. Nothing re-splits an established group, so the window that went
+  fullscreen stayed hidden for the session (measured 2026-09-09).
+- **testSemanticFocusCarriesAHeldWindowLinkedByTheMintedChain** — the second form that evidence takes, for the
+  case where no group exists yet: a cmd+T burst mints a wid per tab and hands the membership down
+  `pendingGroupInheritance`, so a chain member adopted mid-burst has both wids in one chain. Without it the
+  adopted wid stood as a second tile until the burst's last mint was discovered (measured 2026-09-10).
+- **testSemanticFocusDoesNotCarryAHeldWindowOutsideTheChain** — a chain naming only the held window is what
+  the fullscreen transition arms, so it links nothing and the two windows stay apart.
 - **testNamingAWindowInNoGroupJustMovesTheOrder** — the same decision for an ordinary window touches no
   grouping at all.
 
@@ -94,5 +107,5 @@ own any more — both were bursts of 815s and 808s, and neither event can reach 
 
 - **testAnAppExposePickMovesOnlyThePickedWindow** — the pick is a click naming one window, and the re-show
   that puts every window of the app back lands either side of it. Only the picked window may move. The #5936
-  mute never covered this: it was armed when Exposé opened, seconds before the pick. Live QA is the
+  mute never covered this: it was armed when Exposé opened, seconds before the pick. A live run is the
   counterpart.

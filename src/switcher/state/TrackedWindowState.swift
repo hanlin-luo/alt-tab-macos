@@ -59,7 +59,7 @@ struct TrackedWindow: Equatable {
     var isMinimized = false
     var isMainWindow = false
     var isWindowlessApp = false
-    /// the latched CGS phantom verdict (`Window.storedState.isPhantom`); the user-facing value is
+    /// the latched CGS phantom verdict, mirroring `Window.cgsPhantomLatch`; the user-facing value is
     /// `TrackedWindowState.isPhantom(_:)`, derived at read like the live `Window.isPhantom`
     var cgsPhantomLatch = false
     /// The WindowServer's ordered-in bit (`WsWindowState.isVisible`): this window is ON SCREEN right now.
@@ -163,13 +163,18 @@ enum AxElementEndVerdict: Equatable {
     case confirmedClosed
 }
 
+/// `groupShrank`: a still-published sibling's tab bar lost a tab. `groupGone`: no window the app publishes on
+/// a Space the group was on carries the group's `AXTabGroup` identity any more. Either is the positive tab
+/// evidence a retained surface needs; an inactive tab is absent from the app's window list while alive, so
+/// absence alone never condemns a tab. Finder retains the closed group's last surface and sends no destroy
+/// for it, so without `groupGone` a whole-group close left that window pending forever (QA T-09).
 enum AxElementEndPolicy {
     static func decide(ax: AxElementEndAvailability, surfacePresent: Bool, isTabbed: Bool,
-                       groupShrank: Bool, axQueryCoversWindow: Bool) -> AxElementEndVerdict {
+                       groupShrank: Bool, groupGone: Bool, axQueryCoversWindow: Bool) -> AxElementEndVerdict {
         if ax == .foundReplacement { return .replacementFound }
         if !surfacePresent { return .confirmedClosed }
         if ax == .noAnswer { return .inconclusive }
-        if isTabbed { return groupShrank ? .confirmedClosed : .inconclusive }
+        if isTabbed { return groupShrank || groupGone ? .confirmedClosed : .inconclusive }
         if !axQueryCoversWindow { return .inconclusive }
         return .confirmedClosed
     }
@@ -211,8 +216,6 @@ enum TabGroupObservation: Equatable {
         guard case .group(_, let token) = self else { return nil }
         return token
     }
-
-    var wasRead: Bool { self != .unknown }
 }
 
 enum SpaceMembershipObservation: Equatable {
@@ -444,7 +447,8 @@ struct TrackedWindowState: Equatable {
         /// superseded before discovery — opening a tab rather than switching to one.
         var lastWindowCreatedWid: CGWindowID?
         /// The most recent untracked Space JOIN on ANY Space, visible or not — the
-        /// `lastUntrackedVisibleSpaceJoin` pair without the visibility gate. A tab switch inside a window whose
+        /// `lastUntrackedVisibleSpaceJoinWid` / `lastUntrackedVisibleSpaceJoinAt` pair without the
+        /// visibility gate. A tab switch inside a window whose
         /// Space we are no longer LOOKING at still mints a wid, and that mint is still the successor of the one
         /// it replaced; gating on visibility lost exactly that handover (generator seed 106, where a
         /// `newWindow` moves the viewport back to the windowed Space first). Kept separate rather than widening
@@ -481,6 +485,7 @@ struct TrackedWindowState: Equatable {
     var carried = Carried()
 
     var visibleSpaces = [UInt64]()
+    // periphery:ignore - projection no reducer reads today; `TrackedWindowStateFieldsTests` pins the set
     var currentSpaceId: UInt64 = 0
     /// Space topology (`Spaces.idsAndIndexes`), for deriving `spaceIndexes` from `spaceIds`
     var spaceIndexById = [UInt64: Int]()
@@ -594,6 +599,7 @@ struct TrackedWindowState: Equatable {
     // MARK: MRU
 
     /// The window at the front of the MRU, i.e. the one the model currently calls "where the user is".
+    // periphery:ignore - assertion accessor for the MRU tests
     var mruFrontWid: CGWindowID? { windows.first { $0.lastFocusOrder == 0 }?.wid }
 
     /// Record that the OS brought `wid` forward at time `at`, then re-derive the ranks. Usually `at` is the
@@ -660,7 +666,7 @@ struct TrackedWindowState: Equatable {
         // 0, which is exactly the launch case this runs in — `recomputeFocusRanks` re-derives, finds its
         // answer already in place and reports nothing changed. The order really had changed; the reducer
         // just emitted no log and no `.refreshUi` for it, leaving an open switcher drawing the old list.
-        // Live evidence: the 2026-08-25 QA run moved the MRU front onto a Finder window with no
+        // Live evidence, 2026-08-25: the MRU front moved onto a Finder window with no
         // `zOrder seed reordered` line anywhere in its debug log.
         let before = windows.map { $0.lastFocusOrder }
         var zOrder = [CGWindowID: Int]()
@@ -678,9 +684,10 @@ struct TrackedWindowState: Equatable {
     }
 
     /// The log fact every MRU bump emits, read before bumping.
-    func mruBumpLog(_ wid: CGWindowID) -> String {
+    func mruBumpLog(_ wid: CGWindowID, _ source: AttentionWriteSource) -> String {
         let w = window(wid)
-        return "mru bump #\(wid) \(apps[w?.pid ?? 0]?.state.localizedName ?? "?") from=\(w?.lastFocusOrder ?? 0) sp\(w?.spaceIds ?? [])"
+        let by = source == .attentionReducer ? "attention" : "repair"
+        return "mru bump #\(wid) \(apps[w?.pid ?? 0]?.state.localizedName ?? "?") by=\(by) from=\(w?.lastFocusOrder ?? 0) sp\(w?.spaceIds ?? [])"
     }
 
     /// One line per window REMOVAL, naming the path that condemned it. Several paths can remove a window, and
@@ -834,9 +841,8 @@ enum ReducerInput: Equatable {
                                 now: TimeInterval, inSpaceTransition: Bool)                  // 1325/1326
     case spaceTransitionStarted                                                              // 1329/1401, leading edge
     case spaceChangeSettled                                                                  // 1329/1401, debounced
-    /// NSWorkspace didActivateApplication (no WS equivalent). `altTabTargetWid` = a fresh AltTab-initiated
-    /// focus of this app, when known.
-    case appActivated(pid: pid_t, now: TimeInterval, altTabTargetWid: CGWindowID?)
+    /// NSWorkspace didActivateApplication (no WS equivalent)
+    case appActivated(pid: pid_t, now: TimeInterval)
 
     // async read results landing
     /// The apply-side of `Applications.addDiscoveredWindow`: acquisition + discrimination ran in the shell;
@@ -879,12 +885,9 @@ enum ReducerInput: Equatable {
                       answered: Set<CGWindowID>,
                       placedByWindowServer: Set<CGWindowID>, topologyChanged: Bool)
     /// An AX `kAXFocusedWindow` read landed. `viaActivationRead` means the attention model requested the
-    /// bounded read for a factless activation; false means the per-app discovery seed (`Window.checkIfFocused`).
+    /// bounded read for a factless activation; false means the per-app discovery seed (`Window.checkIfFocused`)
+    /// or the read after AltTab's own focus (`WindowServerEvents.readFocusedWindowAfterFocusing`).
     case axFocusedWindowRead(pid: pid_t, wid: CGWindowID, viaActivationRead: Bool)
-    /// AltTab focused a window of the app that is ALREADY frontmost, so no activation is coming to carry the
-    /// target (`WindowServerEvents.noteAltTabInitiatedFocus`). A namer like any other: it says which window
-    /// the user asked for, and `AttentionDriver` decides what that is worth.
-    case altTabFocusedWindowInFrontmostApp(wid: CGWindowID, pid: pid_t, now: TimeInterval)
     /// The bounded `kAXFocusedWindow` read an activation asked for came back with nothing — the app is wedged,
     /// or genuinely has no focused window (`WindowServerEvents.readFocusedWindowOnActivation`). Reported rather than
     /// dropped: unknown is a value, so the model records the silence instead of leaving the read outstanding
@@ -905,8 +908,8 @@ enum ReducerInput: Equatable {
     case zOrderRead(widsTopFirst: [CGWindowID])
 
     /// **The attention reducer committed a decision.** The only input that may move the order: a click or
-    /// Cmd+` naming its target, AltTab's own switch, or an app answering which of
-    /// its windows it considers focused. Physical events reach the model through their own cases and change
+    /// Cmd+` naming its target, or an app answering which of its windows it considers focused. AltTab's own
+    /// switch is not on that list: it moves the order when the OS reports it, like any other switch. Physical events reach the model through their own cases and change
     /// visibility, geometry, membership and Space — never this.
     /// `wid` is where attention lands — the tile the user ends up on. `observed` is the window the provider
     /// actually named, which differs when that window is a background TAB: the driver maps a tab to the
@@ -917,11 +920,28 @@ enum ReducerInput: Equatable {
     // timer checks firing
     case holdReleaseCheck(wid: CGWindowID, attempt: Int)                                     // `checkHoldRelease`
     case dragOutCheck(wid: CGWindowID, previousRepWid: CGWindowID, attempt: Int)             // `checkDragOut`
+    case standaloneTabCheck(wid: CGWindowID, siblingWid: CGWindowID, attempt: Int)
 }
 
 extension ReducerInput {
+    /// Geometry requests may overlap without starving a read. Visibility, lifecycle, Space and committed
+    /// attention edges supersede the old snapshot for their windows, even if the follow-up is still queued.
+    var invalidatedWindowStateReads: Set<CGWindowID> {
+        switch self {
+        case .windowOrderedIn(let wid, _, _), .windowOrderedOut(let wid, _), .windowDestroyed(let wid),
+             .spaceMembershipChanged(let wid, _, _, _, _), .discoveryLanded(let wid, _, _, _, _, _, _),
+             .livenessConfirmedDead(let wid):
+            return [wid]
+        case .attentionCommitted(let wid, let observed, _):
+            return [wid, observed]
+        default:
+            return []
+        }
+    }
+
     /// Fixture compatibility for recordings written before unknown and an explicit negative were distinct.
     /// Their Space arrays were completed answers; nil tab payloads were intentionally non-evidence.
+    // periphery:ignore - fixture-compatibility overload
     static func discoveryLanded(wid: CGWindowID, accepted: Bool, newlyTracked: Bool,
                                 adoptedAsInactiveTab: Bool, queriedSpaceIds: [UInt64], isOrderedIn: Bool,
                                 tabTitles: [String]?, tabGroupToken: TabGroupToken?) -> Self {
@@ -931,6 +951,7 @@ extension ReducerInput {
             isOrderedIn: isOrderedIn, tabGroup: tabs)
     }
 
+    // periphery:ignore - fixture-compatibility overload
     static func titleAndTabsRead(wid: CGWindowID, tabTitles: [String]?, tabGroupToken: TabGroupToken?,
                                  reconcileTabs: Bool, changedSoFar: Bool) -> Self {
         let tabs = tabTitles.map { TabGroupObservation.group(titles: $0, token: tabGroupToken) } ?? .unknown
@@ -940,12 +961,11 @@ extension ReducerInput {
 }
 
 /// A request the reducer makes of the shell — every side effect the orchestration used to fire inline.
-/// The shell executes them verbatim (same calls, same coalescing/throttling), so moving a decision into
+/// The shell executes them verbatim, so moving a decision into
 /// the reducer never changes WHAT happens, only WHERE it's decided.
 enum ReducerEffect: Equatable {
-    /// acquire + discriminate a possibly-new wid (`Applications.discoverWindow`). `throttled` = coalesce
-    /// per wid (the 0×0-at-create re-discovery path, `windowAttributesThrottler` key "wid-N-discover").
-    case discoverWindow(wid: CGWindowID, throttled: Bool)
+    /// acquire + discriminate a possibly-new wid (`Applications.discoverWindow`)
+    case discoverWindow(wid: CGWindowID)
     /// AX-probe a just-ordered-out window; feeds back `livenessConfirmedDead` only when the app also stopped
     /// listing the wid (`removeIfClosedAfterOrderOut`)
     case probeWindowLiveness(CGWindowID)
@@ -953,9 +973,8 @@ enum ReducerEffect: Equatable {
     /// (`Applications.refreshWindowTitleAndTabs`)
     case readTitleAndTabs(wid: CGWindowID, readTabs: Bool)
     /// batched WS geometry/fullscreen query; feeds back `windowServerStateRead`
-    /// (`Applications.updateWindowStatesViaWindowServer`). `throttled` = coalesce per wid (the resize-drag
-    /// path, ≤1 query/200ms, `windowAttributesThrottler` key "wid-N-wsstate").
-    case queryWindowServerState(wids: [CGWindowID], throttled: Bool)
+    /// (`Applications.updateWindowStatesViaWindowServer`); one active batch plus a deduplicated pending set
+    case queryWindowServerState(wids: [CGWindowID])
     /// brute-force an app for inactive-tab windows (`Applications.discoverInactiveTabs`). `requesterWid` is
     /// the window whose AXTabGroup named the missing titles — the scan needs it to reject a candidate that is
     /// plainly another window's tab (`BruteForceWindowMatch.isPlausibleInactiveTab`).
@@ -965,7 +984,7 @@ enum ReducerEffect: Equatable {
     case applyFocus(CGWindowID)
     /// `App.refreshOpenUiAfterExternalEvent(wids)`; some call sites fire only while the switcher is open
     case refreshUi(wids: [CGWindowID], onlyWhileSwitcherOpen: Bool)
-    /// repaint an attention decision without the structural-event throttle
+    /// Reconcile attention's default selection before a modifier release can commit it.
     case refreshUiImmediately(wids: [CGWindowID])
     /// remove the window from the live model (`Windows.removeWindows`, view/scheduler/subscription cleanup)
     case removeWindow(CGWindowID)
@@ -982,6 +1001,8 @@ enum ReducerEffect: Equatable {
     case scheduleHoldReleaseCheck(wid: CGWindowID, attempt: Int)
     /// re-arm the drag-out re-check (`checkDragOut`'s 0.4s timer)
     case scheduleDragOutCheck(wid: CGWindowID, previousRepWid: CGWindowID, attempt: Int)
+    /// confirm that a completed standalone AX read is a real split, not a transient tab-bar gap
+    case scheduleStandaloneTabCheck(wid: CGWindowID, siblingWid: CGWindowID, attempt: Int)
     /// re-read the Space topology alone (`Spaces.refresh` — one CGS round-trip, 0.1ms p50), so the switcher
     /// filters and sorts against the Space being ARRIVED on. Fires on the leading edge of a transition.
     case refreshSpacesTopology

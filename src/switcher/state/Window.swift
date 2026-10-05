@@ -61,8 +61,8 @@ class Window {
     var rowIndex: Int?
     var debugId: String!
     var lastSearchQuery: String?
-    var swAppResults: [SWResult] = []
-    var swTitleResults: [SWResult] = []
+    var swAppMatchSpan: Range<Int>?
+    var swTitleMatchSpan: Range<Int>?
     var swBestSimilarity = 0.0
 
     /// Forwards every `TrackedWindow` field by name — `window.title` resolves to the backing record,
@@ -146,20 +146,6 @@ class Window {
         lastSearchQuery = nil
     }
 
-    /// Update the WindowServer-owned facts (geometry, fullscreen) from a WS snapshot — the live path for
-    /// move/resize events. Title/subrole/tabs/minimized stay on the AX read: WS can't give them cleanly, and
-    /// minimized in particular can't be inferred from the WS ordered-out bit (which also fires for closing /
-    /// other-Space / app-hidden windows). Returns whether a filter-relevant field changed.
-    @discardableResult
-    func updateFromWindowServer(position: CGPoint, size: CGSize, isFullscreen: Bool) -> Bool {
-        let changed = self.position != position || self.size != size || self.isFullscreen != isFullscreen
-        self.position = position
-        self.size = size
-        self.isFullscreen = isFullscreen
-        self.isFullscreenMirrored = false
-        return changed
-    }
-
     /// DERIVED "phantom" verdict, computed at read time and never latched — so a window whose Space
     /// membership recovers shows again immediately. (It was a stored flag written monotonically on every
     /// show, which needed force-clears in three places and flapped with CGS enumeration timing, #5791.)
@@ -172,8 +158,8 @@ class Window {
     ///   a group is the `TabGroups` registry's decision, not phantom detection's;
     /// - otherwise `PhantomWindowDetector.syncVerdict` over the stored record: the strong signal (no Space
     ///   at all — Joplin / Sprig / `show:false` Electron) evaluated live, OR'd with the latched CGS verdict
-    ///   (`tracked.cgsPhantomLatch`, the only place the weak/alpha=0 case can come from — owned by
-    ///   `applyCgsPhantomVerdict`) — see #5714.
+    ///   (`tracked.cgsPhantomLatch`, the only place the weak/alpha=0 case can come from — set by
+    ///   `WindowEventReducer`) — see #5714.
     var isPhantom: Bool {
         if let wid = cgWindowId {
             if Windows.windowsHeldVisibleForTab.contains(wid) { return false }
@@ -189,20 +175,10 @@ class Window {
             isOrderedIn: self.isOrderedIn, alpha: self.alpha)
     }
 
-    /// The raw latched CGS verdict. Get-only on purpose: writing it must go through the two methods below,
-    /// which is what keeps the latch's clearing rules in one place. Never read this as the user-facing
-    /// phantom; that's the derived `isPhantom` above.
+    /// The raw latched CGS verdict. Get-only on purpose: the reducer sets it, and clearing goes through
+    /// `clearCgsPhantomLatch` below, which is what keeps the clearing rules in one place. Never read this
+    /// as the user-facing phantom; that's the derived `isPhantom` above.
     var cgsPhantomLatch: Bool { tracked.cgsPhantomLatch }
-
-    /// Store the authoritative CGS verdict (~250ms post-show, both signals — the only path that can SET the
-    /// weak/alpha=0 case). Returns whether the derived `isPhantom` changed, so callers skip a re-render when
-    /// it didn't (e.g. the verdict flipped on a group member, whose exemption absorbs it).
-    @discardableResult
-    func applyCgsPhantomVerdict(_ verdict: Bool) -> Bool {
-        let before = isPhantom
-        tracked.cgsPhantomLatch = verdict
-        return isPhantom != before
-    }
 
     /// Drop a latched CGS verdict. Used when Space membership recovers (a verdict taken mid-transition is
     /// stale — a weak-signal phantom never loses its Space, so it can't be wrongly cleared here) and when a
@@ -367,13 +343,18 @@ class Window {
     func focus() {
         MainThreadStall.step()
         if let altTabWindow = altTabWindow() {
+            FocusIntents.shared.supersede()
             App.shared.activate(ignoringOtherApps: true)
             altTabWindow.makeKeyAndOrderFront(nil)
             WindowThumbnails.previewSelectedIfNeeded()
         } else if self.isWindowlessApp || cgWindowId == nil {
+            FocusIntents.shared.supersede()
             if let bundleUrl = application.bundleURL, self.isWindowlessApp {
-                if (try? NSWorkspace.shared.launchApplication(at: bundleUrl, configuration: [:])) == nil {
-                    application.runningApplication.activate(options: .activateAllWindows)
+                // `openApplication` reports its outcome on a background queue, so the fallback
+                // activation runs there. `NSRunningApplication.activate` is documented thread safe.
+                let runningApplication = application.runningApplication
+                NSWorkspace.shared.openApplication(at: bundleUrl, configuration: NSWorkspace.OpenConfiguration()) { app, _ in
+                    if app == nil { runningApplication.activate(options: .activateAllWindows) }
                 }
             } else {
                 application.runningApplication.activate(options: .activateAllWindows)
@@ -389,62 +370,133 @@ class Window {
             // and it goes stale after sleep/monitor changes until syncSpacesState re-queries). Treating unknown
             // as cross-Space ran SLSSpaceSetFrontPSN on the CURRENT Space, re-fronting the previous app and
             // undoing the raise while the window stayed key (#5586, the Slack-after-sleep variant).
-            // AltTab knows exactly which window it is focusing — record it so the coming app activation
-            // bumps this window directly instead of divining the focus from a racy 808 / AX read (#5596).
-            WindowServerEvents.noteAltTabInitiatedFocus(cgWindowId!, application.pid)
+            // The window order is NOT moved here. It moves when the OS reports the focus (#6055).
+            let generation = FocusIntents.shared.request(wid: cgWindowId!, pid: application.pid)
             Windows.promoteAttentionEvidence(cgWindowId!)
             let targetMaybeCrossSpace = !self.spaceIds.isEmpty && !self.spaceIds.contains(originSpaceId)
             let originFrontPid = targetMaybeCrossSpace
-                ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil
+                ? NSWorkspace.shared.frontmostApplication.flatMap(Applications.knownPid) : nil
             BackgroundWork.accessibilityCommandsQueue.addOperation { [weak self] in
-                guard let self else { return }
-                if self.isMinimized, let element = self.axUiElement {
-                    try? element.setAttribute(kAXMinimizedAttribute, false)
-                }
-                // Focusing another app's window reliably takes the steps below. The public APIs alone don't
-                // move key focus across apps (macOS 14 downgraded NSRunningApplication.activate to an advisory
-                // "request").
-                //   1. _SLPSSetFrontProcessWithOptions fronts the process + the target window (passing the wid
-                //      raises only that window, not all the app's windows). For a cross-Space target it also
-                //      makes macOS switch to a Space showing it. The global front clobbers the front process of
-                //      other Spaces where the app has windows (they pop on Space entry, #4507); step 4 repairs
-                //      the origin Space for a cross-Space focus.
-                //   2. makeKeyWindow: make it key, via a synthetic mouse-down/up aimed just outside the window,
-                //      so it becomes key without clicking its content (a top-left click would hit fullscreen UI, #5381).
-                //   3. raiseWindow (kAXRaiseAction): raise it within the app's own window stack. If our cached
-                //      element went stale (the app silently rebuilt the window's a11y node, #5586), this returns
-                //      .invalidUIElement and no-ops, so re-resolve the live element by wid, retry, and heal the
-                //      cache; _SLPS/makeKeyWindow above use the wid/psn directly so they're unaffected.
-                //   4. cross-Space only: restore the origin Space's front process (see snapshot above).
-                var psn = ProcessSerialNumber()
-                GetProcessForPID(self.application.pid, &psn)
-                _SLPSSetFrontProcessWithOptions(&psn, self.cgWindowId!, SLPSMode.userGenerated.rawValue)
-                makeKeyWindow(&psn, self.cgWindowId!)
-                // Step 3 is the only AX-dependent step: 1 and 2 use the wid and psn directly, so a window
-                // with no element still gets fronted and made key — which is the whole point of keeping a
-                // hung app's window trackable.
-                if self.axUiElement?.raiseWindow() != .success, let fresh = self.refreshedAxElement() {
-                    fresh.raiseWindow()
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.axUiElement != fresh else { return }
-                        self.rebindAxElement(fresh)
-                        Windows.promoteVerified(self.cgWindowId ?? 0)
-                    }
-                }
-                // step 4 (#4507): undo step 1's clobber of the origin Space. The front-switch made that Space
-                // remember our app as its front; restore the app that was there before (snapshotted above) so
-                // returning shows it, not our window. Cross-Space only (originFrontPid is nil otherwise), and
-                // skipped when the origin's front was already this app.
-                if let originFrontPid, originFrontPid != self.application.pid {
-                    var originPsn = ProcessSerialNumber()
-                    GetProcessForPID(originFrontPid, &originPsn)
-                    SLSSpaceSetFrontPSN(CGS_CONNECTION, originSpaceId, originPsn)
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                    WindowThumbnails.previewSelectedIfNeeded()
-                }
+                self?.applyFocus(generation, originSpaceId, originFrontPid)
             }
         }
+    }
+
+    /// Focusing another app's window reliably takes the steps below. The public APIs alone don't move key
+    /// focus across apps (macOS 14 downgraded NSRunningApplication.activate to an advisory "request").
+    ///   1. _SLPSSetFrontProcessWithOptions fronts the process + the target window (passing the wid raises
+    ///      only that window, not all the app's windows). For a cross-Space target it also makes macOS switch
+    ///      to a Space showing it. The global front clobbers the front process of other Spaces where the app
+    ///      has windows (they pop on Space entry, #4507); step 4 repairs the origin Space for a cross-Space
+    ///      focus.
+    ///   2. makeKeyWindow: make it key, via a synthetic mouse-down/up aimed just outside the window, so it
+    ///      becomes key without clicking its content (a top-left click would hit fullscreen UI, #5381).
+    ///   3. raiseWindow (kAXRaiseAction): raise it within the app's own window stack. If our cached element
+    ///      went stale (the app silently rebuilt the window's a11y node, #5586), this returns
+    ///      .invalidUIElement and no-ops, so re-resolve the live element by wid, retry, and heal the cache;
+    ///      _SLPS/makeKeyWindow above use the wid/psn directly so they're unaffected.
+    ///   4. cross-Space only: restore the origin Space's front process (snapshotted by the caller).
+    ///
+    /// This queue runs 4 operations at once, and steps 0 and 3 each block for up to the 1s AX messaging
+    /// timeout, so a second alt-tab starts a second operation while this one is still inside a step. Each step
+    /// is therefore skipped once a newer focus exists, and a superseded operation that already moved the
+    /// z-order re-asserts the newer intent on its way out — see FocusIntentPolicySpecs.md.
+    private func applyFocus(_ generation: FocusGeneration, _ originSpaceId: CGSSpaceID, _ originFrontPid: pid_t?) {
+        guard FocusIntents.shared.mayProceed(generation) else { return }
+        #if DEBUG
+        if FocusIntents.shared.consumeRefusalForQa() { return refusedForQa() }
+        #endif
+        if self.isMinimized, let element = axUiElement {
+            try? element.setAttribute(kAXMinimizedAttribute, false)
+        }
+        // Step 0 is the only step that blocks BEFORE this operation has touched the screen, so a supersede
+        // caught here owes nothing. Counting the restore as a z-order move and repairing on this exit was
+        // tried and measured useless (2026-09-09): the re-front lands while macOS is still animating
+        // the window out of the Dock, and the restore draws over it afterwards. Nothing this operation can do
+        // on its way out recalls a restore already in flight.
+        guard FocusIntents.shared.mayProceed(generation) else { return }
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(application.pid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, cgWindowId!, SLPSMode.userGenerated.rawValue)
+        FocusIntents.shared.noteReordered(generation)
+        makeKeyAndRaise(generation, &psn)
+        restoreOriginSpaceFront(originSpaceId, originFrontPid)
+        repairIfSuperseded(generation)
+        guard FocusIntents.shared.mayProceed(generation) else { return }
+        hearWhereFocusLanded()
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
+            WindowThumbnails.previewSelectedIfNeeded()
+        }
+    }
+
+    private func hearWhereFocusLanded() {
+        let pid = application.pid
+        DispatchQueue.main.async { WindowServerEvents.readFocusedWindowAfterFocusing(pid) }
+    }
+
+    #if DEBUG
+    /// The operation still asks where focus landed, as a real one the OS ignored would.
+    private func refusedForQa() {
+        Logger.info { "QA: refused the focus of #\(self.cgWindowId ?? 0)" }
+        hearWhereFocusLanded()
+    }
+    #endif
+
+    /// Steps 2 and 3. Step 3 is the only AX-dependent step: 1 and 2 use the wid and psn directly, so a window
+    /// with no element still gets fronted and made key — which is the whole point of keeping a hung app's
+    /// window trackable. The guard before the #5586 re-resolve is the one that pays: it follows a call that
+    /// may have blocked for the full 1s timeout, and the re-resolve itself costs up to 1.25s more.
+    private func makeKeyAndRaise(_ generation: FocusGeneration, _ psn: inout ProcessSerialNumber) {
+        guard FocusIntents.shared.mayProceed(generation) else { return }
+        makeKeyWindow(&psn, cgWindowId!)
+        FocusIntents.shared.noteReordered(generation)
+        guard FocusIntents.shared.mayProceed(generation) else { return }
+        if let element = axUiElement, raise(element, generation) { return }
+        guard FocusIntents.shared.mayProceed(generation), let fresh = refreshedAxElement() else { return }
+        _ = raise(fresh, generation)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.axUiElement != fresh else { return }
+            self.rebindAxElement(fresh)
+            Windows.promoteVerified(self.cgWindowId ?? 0)
+        }
+    }
+
+    /// A raise reports the touch only when it lands: a `.invalidUIElement` no-op moved nothing, and stamping
+    /// it would make a repair look owed for a screen this operation never changed.
+    private func raise(_ element: AXUIElement, _ generation: FocusGeneration) -> Bool {
+        guard element.raiseWindow() == .success else { return false }
+        FocusIntents.shared.noteReordered(generation)
+        return true
+    }
+
+    /// Step 4 (#4507): undo step 1's clobber of the origin Space. The front-switch made that Space remember
+    /// our app as its front; restore the app that was there before so returning shows it, not our window.
+    /// Cross-Space only (originFrontPid is nil otherwise), and skipped when the origin's front was already
+    /// this app. Owed by whoever ran step 1, so it is never skipped for being superseded.
+    private func restoreOriginSpaceFront(_ originSpaceId: CGSSpaceID, _ originFrontPid: pid_t?) {
+        guard let originFrontPid, originFrontPid != application.pid else { return }
+        var originPsn = ProcessSerialNumber()
+        GetProcessForPID(originFrontPid, &originPsn)
+        SLSSpaceSetFrontPSN(CGS_CONNECTION, originSpaceId, originPsn)
+    }
+
+    /// A z-order call is a post to another process, so it can land after a newer focus already switched and
+    /// leave the menu bar naming the new app while the old window sits on top. Re-assert the newer intent.
+    /// The wid goes in so the policy can tell that apart from a stale operation aiming at the SAME window as
+    /// the newer one, whose late raise puts exactly the right window on top and owes nothing.
+    /// Steps 1 and 2 only: step 3 would need that window's AX element, and `Windows` is main-thread state,
+    /// while the wid and psn are enough to front it and make it key again.
+    private func repairIfSuperseded(_ generation: FocusGeneration) {
+        guard let intent = FocusIntents.shared.finish(generation, wid: cgWindowId ?? 0) else { return }
+        var psn = ProcessSerialNumber()
+        GetProcessForPID(intent.pid, &psn)
+        _SLPSSetFrontProcessWithOptions(&psn, intent.wid, SLPSMode.userGenerated.rawValue)
+        makeKeyWindow(&psn, intent.wid)
+        // The one path that fronts a window nobody just asked for, so it says so: without this a repair is
+        // indistinguishable in the log from an ordinary switch, and reading one back out of a run took an
+        // elimination over every other emitter of that naming (F-01, 2026-09-17).
+        Logger.debug { "focus repair: re-asserting #\(intent.wid) over the late \(self.cgWindowId ?? 0)" }
+        DispatchQueue.main.async { WindowServerEvents.readFocusedWindowAfterFocusing(intent.pid) }
     }
 
     /// For some windows (e.g. Slack) the AX API returns no title, so we fall back to the WindowServer's, and
@@ -455,7 +507,13 @@ class Window {
     /// synchronous WindowServer round trip on the show path — and the batched query that fills the inventory
     /// already fetched exactly this string (`SLSWindowIteratorCopyTitle`), refreshed on every geometry event.
     /// The live call remains for a wid the inventory has no row for, so nothing that used to resolve stops.
+    /// Flattened on the way in, so no consumer ever sees a line break: `WindowTitle` says what that costs
+    /// when one gets through.
     func bestEffortTitle(_ axTitle: String?) -> String {
+        WindowTitle.singleLine(rawBestEffortTitle(axTitle))
+    }
+
+    private func rawBestEffortTitle(_ axTitle: String?) -> String {
         if let axTitle, !axTitle.isEmpty {
             return axTitle
         }

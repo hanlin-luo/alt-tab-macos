@@ -6,10 +6,9 @@
 /// one timestamp by construction, which is what makes that intersect work — so nothing here may round,
 /// bucket or de-duplicate them.
 ///
-/// What did change: the arrays now live in memory and are written back on a debounce. Every `record` used to
-/// read the whole array out of `UserDefaults` (an `as? [Int]` conditional cast, per element), append one Int,
-/// and write the whole array back — on every switcher summon, against an array that grows all year. Both
-/// halves showed up on a 51s Instruments trace. The cache is owned by `writeQueue`; reads hop onto it.
+/// The arrays live in memory and are written back on a debounce: reading the whole array out of `UserDefaults`
+/// (an `as? [Int]` conditional cast, per element) and writing it back on every summon showed up on a 51s
+/// Instruments trace, against an array that grows all year. The cache is owned by `writeQueue`; reads hop onto it.
 struct UsageStats {
     private static let defaults = UserDefaults(suiteName: "\(App.bundleIdentifier).usage")!
     private static let writeQueue = DispatchQueue(label: "UsageStats.writeQueue", qos: .utility)
@@ -25,6 +24,11 @@ struct UsageStats {
     private static var cache = [String: [Int]]()
     private static var dirty = Set<String>()
     private static var flushScheduled = false
+    #if DEBUG
+    /// Set by `QaSurfaces`, so the counts the About window and the Pro prompts quote are the same on every run.
+    /// Read in place of what is stored; recording still goes to the real arrays.
+    static var qaPinned: [String: [Int]]?
+    #endif
 
     static func recordTrigger(_ shortcutIndex: Int) {
         record("triggers")
@@ -38,7 +42,17 @@ struct UsageStats {
     static func recordSearchIfFirst() {
         guard !searchRecordedThisSession else { return }
         searchRecordedThisSession = true
+        SearchDiscoveryHint.shared.searchWasUsed()
         record("searches")
+    }
+
+    /// Read once off-main; malformed stored data remains unknown instead of advertising unused Search.
+    static func loadPreviousSearch(_ completion: @escaping (Bool?) -> Void) {
+        writeQueue.async {
+            let raw = defaults.object(forKey: "searches")
+            let used = raw == nil ? false : (raw as? [Int]).map { !$0.isEmpty }
+            DispatchQueue.main.async { completion(used) }
+        }
     }
 
     static func resetSession() {
@@ -68,14 +82,6 @@ struct UsageStats {
         }
     }
 
-    static func usedAppIconsOrTitles() -> Bool {
-        count("triggersAppIcons", since: Date.distantPast) > 0 || count("triggersTitles", since: Date.distantPast) > 0
-    }
-
-    static func usedSearch() -> Bool { count("searches", since: Date.distantPast) > 0 }
-    static func usedAutoSize() -> Bool { count("triggersAutoSize", since: Date.distantPast) > 0 }
-    static func usedExtraShortcuts() -> Bool { count("triggersExtraShortcuts", since: Date.distantPast) > 0 }
-
     static func prune() {
         let cutoff = Int(Date().timeIntervalSince1970 - maxAge)
         writeQueue.async {
@@ -102,7 +108,7 @@ struct UsageStats {
         writeQueue.async {
             ensureLoadedOnQueue(key)
             // `subscript(_:default:)` mutates in place; `cache[key] = cache[key]! + [now]` would copy the
-            // whole year of timestamps on every summon, which is half of what this rewrite is removing.
+            // whole year of timestamps on every summon.
             cache[key, default: []].append(now)
             dirty.insert(key)
             scheduleFlushOnQueue()
@@ -121,6 +127,9 @@ struct UsageStats {
     }
 
     private static func loadOnQueue(_ key: String) -> [Int] {
+        #if DEBUG
+        if let qaPinned { return qaPinned[key] ?? [] }
+        #endif
         ensureLoadedOnQueue(key)
         return cache[key]!
     }

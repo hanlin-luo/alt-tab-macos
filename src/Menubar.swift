@@ -159,7 +159,7 @@ class Menubar {
     /// Assigning the menu only for the duration of a synthesized click keeps the branch above while
     /// letting AppKit position the menu and highlight the icon. Clearing `menu` on the next line is
     /// safe because `performClick` doesn't return until menu tracking ends.
-    private static func popUpMenu() {
+    static func popUpMenu() {
         statusItem.menu = menu
         statusItem.button!.performClick(nil)
         statusItem.menu = nil
@@ -269,7 +269,6 @@ class UpgradeMenuItemView: NSView {
     private let backdrop = NSView()
     private var highlightObservation: NSKeyValueObservation?
     private let gradientLayer = ProGradient.makeLayer()
-    private var isShining = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -293,7 +292,7 @@ class UpgradeMenuItemView: NSView {
         let icon = NSImageView()
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.image = NSImage.fromSymbol(.starFill, pointSize: 11)
-        if #available(macOS 10.14, *) { icon.contentTintColor = .white }
+        icon.contentTintColor = .white
         icon.setContentHuggingPriority(.required, for: .horizontal)
         icon.setContentCompressionResistancePriority(.required, for: .horizontal)
         addSubview(icon)
@@ -322,12 +321,14 @@ class UpgradeMenuItemView: NSView {
         fatalError("Class only supports programmatic initialization")
     }
 
+    override var intrinsicContentSize: NSSize {
+        let labelSize = label.intrinsicContentSize
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(labelSize.height) + 6)
+    }
+
     override func layout() {
         super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        gradientLayer.frame = backdrop.bounds
-        CATransaction.commit()
+        caTransaction { gradientLayer.frame = backdrop.bounds }
     }
 
     override func viewDidMoveToWindow() {
@@ -350,32 +351,7 @@ class UpgradeMenuItemView: NSView {
     }
 
     private func playShineAnimation() {
-        guard !isShining else { return }
-        let pillBounds = gradientLayer.bounds
-        let shine = CAGradientLayer()
-        shine.colors = [
-            NSColor.white.withAlphaComponent(0).cgColor,
-            NSColor.white.withAlphaComponent(0.3).cgColor,
-            NSColor.white.withAlphaComponent(0).cgColor,
-        ]
-        shine.locations = [0, 0.5, 1]
-        shine.startPoint = CGPoint(x: 0, y: 0.5)
-        shine.endPoint = CGPoint(x: 1, y: 0.5)
-        shine.frame = CGRect(x: -pillBounds.width, y: 0, width: pillBounds.width, height: pillBounds.height)
-        gradientLayer.addSublayer(shine)
-        isShining = true
-        let animation = CABasicAnimation(keyPath: "position.x")
-        animation.fromValue = -pillBounds.width / 2
-        animation.toValue = pillBounds.width + pillBounds.width / 2
-        animation.duration = 0.6
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        CATransaction.begin()
-        CATransaction.setCompletionBlock { [weak self] in
-            shine.removeFromSuperlayer()
-            self?.isShining = false
-        }
-        shine.add(animation, forKey: "shine")
-        CATransaction.commit()
+        ProGradient.playShine(over: gradientLayer)
     }
 
     func updateContent(_ state: LicenseState) {
@@ -403,6 +379,9 @@ class UpgradeMenuItemView: NSView {
         result.append(NSAttributedString(string: "\n", attributes: mainAttrs))
         result.append(NSAttributedString(string: NSLocalizedString("Get Pro", comment: "Menubar option"), attributes: mainAttrs))
         label.attributedStringValue = result
+        invalidateIntrinsicContentSize()
+        let height = intrinsicContentSize.height
+        if frame.height != height { frame.size.height = height }
     }
 
     override func mouseUp(with event: NSEvent) {

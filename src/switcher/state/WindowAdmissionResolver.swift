@@ -4,13 +4,17 @@ import Cocoa
 /// should offer: sheets, children, panels and menus are surfaces too.
 struct PhysicalSurface: Equatable {
     let wid: CGWindowID
+    // periphery:ignore - read by the synthesized Equatable
     let pid: pid_t
     let bounds: CGRect
     let level: CGWindowLevel
     let parentWid: CGWindowID
+    // periphery:ignore - read by the synthesized Equatable
     let isVisible: Bool
+    // periphery:ignore - read by the synthesized Equatable
     let isMinimized: Bool
     let isFullscreen: Bool
+    // periphery:ignore - read by the synthesized Equatable
     let alpha: Float
 
     init(wid: CGWindowID, pid: pid_t, bounds: CGRect, level: CGWindowLevel, parentWid: CGWindowID = 0,
@@ -167,11 +171,15 @@ enum WindowAdmissionResolver {
     /// not a switch destination however the focus got there. A role it FAILED to read is not that refusal — a
     /// nil role is the absence of an answer, and reading absence as a verdict is the mistake
     /// `WindowElementAcquisition` exists to prevent.
+    ///
+    /// Attention never refuses what discovery admits. Emacs 29.4 (emacsformacosx.com) reports its frames as
+    /// role `AXTextField`, subrole `AXStandardWindow`, and discovery accepts them on the subrole
+    /// (`testExactAttentionKeepsAStandardWindowWithATextFieldRole`).
     private static func attentionDecision(_ physical: PhysicalSurface,
                                           _ semantic: SemanticSurface?) -> SwitchDestinationDecision {
         guard admissiblePlacement(physical, semantic) else { return .reject(.auxiliarySurface) }
-        guard let semantic else { return .destination(.exactAttention) }
-        guard semantic.role == nil || semantic.isWindowRole else { return .reject(.nonWindowRole) }
-        return .destination(.exactAttention)
+        guard let semantic, semantic.role != nil, !semantic.isWindowRole else { return .destination(.exactAttention) }
+        let discovery = resolve(physical, semantic)
+        return discovery.isDestination ? discovery : .reject(.nonWindowRole)
     }
 }

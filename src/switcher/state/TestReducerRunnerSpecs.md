@@ -98,7 +98,7 @@ the scenario layer drives it, and its per-step invariants police every scenario.
 
 - **Acquisition + admission + attribute ingestion** (`WindowAdmissionResolver`, `findOrCreate`,
   `bestEffortTitle`): AX/CGS IPC and object creation; the reducer takes over at `discoveryLanded`.
-- **Throttling/coalescing** (`windowAttributesThrottler` etc.): IO pacing, carried on effects as flags.
+- **IO scheduling/coalescing**: queue ownership and runloop batching stay in the live shell.
 - **`Windows.removeWindows`**: view/scheduler/subscription cleanup stays live; the reducer decides WHEN
   (`removeWindow` effect) and the harness twins the model part. The MRU-shift semantics exist twice
   (live + harness twin) — the one accepted duplication.
@@ -149,12 +149,27 @@ report a violation. These are tests OF the harness, not of the reducer.
   window's representative leaving the windowed one.
 - **testFullscreenTabSwitchToAReusedWidFrontsItAtDiscovery** — a fullscreen switch to a REUSED background wid
   carries no focus signal at all, so the incoming tab must be fronted explicitly at discovery; otherwise the
-  switcher shows the PREVIOUS tab until reopened (2026-07-22 QA).
+  switcher shows the PREVIOUS tab until reopened (measured live, 2026-07-22).
 - **testTitlesThatNameNothingKeepTheGroup** — an AX read naming 2+ tabs and matching NO window says the
   titles aren't comparable (#5785) or the siblings aren't tracked; either way the group stands.
 - **testTitleReadThatChangesMembershipLeavesAFixedPoint** — a title read that changes membership must
   reconcile, or derived per-member facts (above all the fullscreen mirror) stay stale and the state is not a
   reconcile fixed point.
+- **testStandaloneActiveTabAtASecondPhysicalFrameLeavesItsOldGroup** — T-06's selected Finder tab was
+  successfully dragged into a second window, but the completed standalone AX answer followed the transient-
+  nil keep rule and left all three wids grouped forever. A second ordered-in window on the same directly-
+  observed Space, still at a different frame after a WindowServer re-query, confirms the split.
+- **testTransientStandaloneAnswerCannotSplitARecoveredTabGroup** — the safety side: a newer AX group answer
+  arriving before physical confirmation cancels the split, because real tab switches expose standalone
+  transiently too.
+- **testStandaloneAnswerSplitsEvenWhenTheWindowWasAlreadyRecordedStandalone** — T-06's live shape
+  (2026-09-17), with the two facts that each kept the group whole on their own: the escaped tab was
+  DISPLACED before being dragged out, so its standalone answer is not a group→standalone edge; and it still
+  wears `spaceIsBorrowed`, the annotation every group pass re-applies to its members, while CGS places it on
+  a Space in its own right. Physical presence is therefore read off `spaceMembershipObservation`.
+- **testStandaloneAnswerFromAnOrderedOutTabArmsNothing** — an inactive tab answers standalone on every read
+  and must arm nothing: being ordered OUT, on no Space of its own, is what separates it from a window that
+  escaped its group.
 
 ### C. Order-in, and what it is still allowed to mean
 
@@ -162,9 +177,8 @@ An 815 cannot move the window order any more (see `WindowEventReducerFocusSpecs`
 the bookkeeping it still owns: an untracked wid it names, and the sequences a real capture recorded.
 
 - **testTwoAltTabsIntoTheSameAppBothMoveTheOrder** — two alt-tabs 219ms apart into one app. The second is a
-  switch inside the app that is already frontmost, so no activation follows it and AltTab naming its own
-  target is the only thing that says the user moved. Unheard, nothing ever corrects it (#5785's stuck
-  switcher).
+  switch inside the app that is already frontmost, so no activation follows it and the app's answer is the
+  only thing that says the user moved. Unheard, nothing ever corrects it (#5785's stuck switcher).
 - **testLeavingFullscreenDoesNotRefrontTheAppsOtherWindows** — the recorded #5849 follow-up: leaving
   fullscreen re-shows the whole desktop Space and every window on it is ordered in. A replay of the capture,
   kept now that the inference that misread it is gone.
@@ -215,7 +229,7 @@ order nothing pins, so both arrival orders are tested — the same thing `Handov
   `replacedWid` that `dragOutVerdict` reads as settled.
 - **testMintedTabSwitchKeepsTheTabsTheTitlesAlreadyGrouped** — the handover claims a REPRESENTATIVE, not a
   membership. When the AXTabGroup titles land in the same discovery and group the mint with every tab of the
-  window, re-forming from the inherited pair would evict the rest, since `formGroup` is exact-set. Live QA
+  window, re-forming from the inherited pair would evict the rest, since `formGroup` is exact-set. Measured live
   C-10: one 4-tab Finder window drawn as two tiles.
 - **testHandoverIsClearedWhenTheReplacedWindowComesBack** — the edge describes the CURRENT state, so it
   expires when either end moves again.
@@ -240,7 +254,7 @@ has to be reported accurately.
   launch case it runs in) the re-derivation finds its own answer already in place and reports nothing. The
   reducer then emits no log and no `.refreshUi` while the order really has changed, and an open switcher
   keeps drawing the old list. Teeth-verified: it fails against the pre-fix `return recomputeFocusRanks()`.
-  Live evidence — the 2026-08-25 QA run moved the MRU front onto a Finder window with no
+  Live evidence, 2026-08-25 — the MRU front moved onto a Finder window with no
   `zOrder seed reordered` line anywhere in its debug log, which is why three investigations dead-ended.
 - **testZOrderThatChangesNothingSaysNothing** — the other side: a seed that really changes nothing stays
   silent, so a first summon does not repaint for nothing.

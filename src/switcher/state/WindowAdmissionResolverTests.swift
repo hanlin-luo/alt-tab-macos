@@ -63,6 +63,15 @@ final class WindowAdmissionResolverTests: XCTestCase {
             evidence: .attention), .reject(.nonWindowRole))
     }
 
+    /// Emacs 29.4's frame as read in #6072. Discovery admits it on the subrole, so focusing it must not
+    /// remove it: each removal re-added the window at the end of the switching order.
+    func testExactAttentionKeepsAStandardWindowWithATextFieldRole() {
+        let s = semantic(title: "emacs@host : main.tex", role: kAXTextFieldRole, isMain: true)
+        XCTAssertEqual(WindowAdmissionResolver.resolve(physical(), s), .destination(.conventionalWindow))
+        XCTAssertEqual(WindowAdmissionResolver.resolve(physical(), s, evidence: .attention),
+            .destination(.conventionalWindow))
+    }
+
     /// A role accessibility FAILED to read is not a refusal. Attention still speaks for the surface, which is
     /// what keeps a window alive through an app that answers some attributes and not others.
     func testExactAttentionSurvivesARoleAccessibilityCouldNotRead() {
@@ -260,6 +269,34 @@ final class ApplicationAdmissionResolverTests: XCTestCase {
     func testZombieIsRejectedEvenWhenAttentionNamesIt() {
         XCTAssertFalse(ApplicationAdmissionResolver.accepts(isXpc: false, isZombie: true,
             isKnownUserFacingException: false, evidence: .attention))
+    }
+
+    /// The window manager is a regular process, so nothing else refuses it; and a click on the desktop is
+    /// exact attention on one of its surfaces, so the refusal has to hold for attention too.
+    func testWindowManagerIsRejectedEvenWhenAttentionNamesIt() {
+        XCTAssertFalse(ApplicationAdmissionResolver.accepts(isXpc: false, isZombie: false,
+            isKnownUserFacingException: false, isWindowManager: true, evidence: .discovery))
+        XCTAssertFalse(ApplicationAdmissionResolver.accepts(isXpc: false, isZombie: false,
+            isKnownUserFacingException: false, isWindowManager: true, evidence: .attention))
+    }
+}
+
+final class ApplicationPidResolverTests: XCTestCase {
+    func testWindowServerPidSurvivesAnInvalidRunningApplicationPid() {
+        XCTAssertEqual(ApplicationPidResolver.resolve(discoveredPid: 42, reportedPid: -1), 42)
+    }
+
+    func testDiscoveredPidRemainsCanonicalWhenLaunchServicesChanges() {
+        XCTAssertEqual(ApplicationPidResolver.resolve(discoveredPid: 42, reportedPid: 99), 42)
+    }
+
+    func testRunningApplicationPidIsUsedWithoutDiscoveryEvidence() {
+        XCTAssertEqual(ApplicationPidResolver.resolve(discoveredPid: nil, reportedPid: 42), 42)
+    }
+
+    func testInvalidPidsDoNotCreateAnApplicationIdentity() {
+        XCTAssertNil(ApplicationPidResolver.resolve(discoveredPid: nil, reportedPid: -1))
+        XCTAssertNil(ApplicationPidResolver.resolve(discoveredPid: 0, reportedPid: 0))
     }
 }
 

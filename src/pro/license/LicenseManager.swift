@@ -1,8 +1,18 @@
 import Foundation
 
 class LicenseManager {
-    static let keychainService = "\(App.bundleIdentifier).license"
-    static let defaultsSuiteName = "\(App.bundleIdentifier).license"
+    static var keychainService: String {
+        #if DEBUG
+        if QaLifecycleEnvironment.enabled { return QaLifecycleEnvironment.namespace }
+        #endif
+        return "\(App.bundleIdentifier).license"
+    }
+    static var defaultsSuiteName: String {
+        #if DEBUG
+        if QaLifecycleEnvironment.enabled { return QaLifecycleEnvironment.namespace }
+        #endif
+        return "\(App.bundleIdentifier).license"
+    }
 
     static let shared: LicenseManager = {
         let keychain = SystemKeychain(service: keychainService)
@@ -105,6 +115,13 @@ class LicenseManager {
     var daysSinceTrialStart: Int {
         guard let start = trialStartDate else { return 0 }
         return Int(clock.now.timeIntervalSince(start) / 86400)
+    }
+
+    /// 1-indexed, like the "Day N" of `ProTransitionSpecs.md`. Nil when no trial ever started, or when the clock
+    /// is set before the trial start, rather than a made-up day.
+    var trialDay: Int? {
+        guard let start = trialStartDate, clock.now >= start else { return nil }
+        return daysSinceTrialStart + 1
     }
 
     init(clock: Clock, keychain: Keychain, api: LicenseAPI, defaults: UserDefaults) {

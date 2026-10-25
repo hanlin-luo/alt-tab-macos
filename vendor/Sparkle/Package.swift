@@ -13,9 +13,13 @@ let package = Package(
             name: "Sparkle",
             path: "Sources/Sparkle",
             resources: [
-                .process("SUStatus.xib"),
-                .process("SUUpdateAlert.xib"),
-                .process("SUUpdatePermissionPrompt.xib"),
+                // Pre-compiled nibs, not the upstream .xibs. SPM compiles .xib with ibtool, which
+                // only ships with Xcode — a Command Line Tools-only build cannot run it. The nibs
+                // come from the matching upstream release tarball (see vendor/scripts/update_sparkle.sh),
+                // so they are byte-identical to what ibtool would have produced.
+                .copy("SUStatus.nib"),
+                .copy("SUUpdateAlert.nib"),
+                .copy("SUUpdatePermissionPrompt.nib"),
                 .process("ReleaseNotesColorStyle.css"),
             ],
             publicHeadersPath: "include",

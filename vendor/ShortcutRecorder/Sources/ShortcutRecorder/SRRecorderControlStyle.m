@@ -735,6 +735,14 @@ NSUserInterfaceLayoutDirection SRRecorderControlStyleComponentsLayoutDirectionTo
                 if (!data)
                     data = [[NSDataAsset alloc] initWithName:resourceName bundle:SRBundle()].data;
 
+                // The style description is a data asset, and NSDataAsset only sees assets that live in a
+                // COMPILED asset catalog. When the catalog could not be compiled (compiling it needs
+                // actool, which ships with Xcode only), fall back to the dataset's info.json — the very
+                // bytes the compiled catalog would have held. Without this, loading the style raises
+                // "Missing sr-mojave-info" and takes the app down with it.
+                if (!data)
+                    data = [NSData dataWithContentsOfURL:[SRBundle() URLForResource:resourceName withExtension:@"json"]];
+
                 if (!data)
                     [NSException raise:NSInternalInconsistencyException format:@"Missing %@", resourceName];
 

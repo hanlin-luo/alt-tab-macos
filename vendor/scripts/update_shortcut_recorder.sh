@@ -43,6 +43,22 @@ patch_sr_bundle() {
 }
 patch_sr_bundle
 
+# The style description ("sr-mojave-info") is a data asset, and NSDataAsset only sees assets in a
+# COMPILED asset catalog. When the catalog could not be compiled — compiling it needs actool, which
+# ships with Xcode only — the lookup returns nil and the style loader raises
+# "Missing sr-mojave-info", which takes the app down. Fall back to the dataset's info.json, i.e.
+# the very bytes the compiled catalog would have held.
+patch_sr_style_info_fallback() {
+	local f="$DEST/Sources/ShortcutRecorder/SRRecorderControlStyle.m"
+	[ -f "$f" ] || return 0
+	sed -i.bak '/\[NSException raise:NSInternalInconsistencyException format:@"Missing %@", resourceName\];/i\
+                if (!data)\
+                    data = [NSData dataWithContentsOfURL:[SRBundle() URLForResource:resourceName withExtension:@"json"]];\
+' "$f"
+	rm -f "$f.bak"
+}
+patch_sr_style_info_fallback
+
 apply_local_patches "$DEST"
 
 # Write Package.swift (regenerated each update so the manifest stays in sync with the layout)
@@ -61,7 +77,18 @@ let package = Package(
         .target(
             name: "ShortcutRecorder",
             path: "Sources/ShortcutRecorder",
-            resources: [.process("Images.xcassets")],
+            // Images.xcassets and the .lproj dirs are excluded instead of being declared as SPM
+            // resources: compiling the asset catalog needs actool, which only ships with Xcode, so
+            // a Command Line Tools-only build would fail. The app bundle assembler
+            // (scripts/build_local.sh) builds ShortcutRecorder_ShortcutRecorder.bundle by hand —
+            // the flat PNGs that `-[NSBundle imageForResource:]` looks up, plus the
+            // <lang>.lproj/ShortcutRecorder.strings tables SRLoc() reads.
+            exclude: [
+                "Images.xcassets",
+                "de.lproj", "en.lproj", "es.lproj", "fr.lproj", "it.lproj", "ja.lproj",
+                "ko.lproj", "nl.lproj", "pl.lproj", "pt-BR.lproj", "ru.lproj", "sv.lproj",
+                "th.lproj", "zh-Hans.lproj", "zh-Hant.lproj",
+            ],
             publicHeadersPath: "include",
             cSettings: [
                 // Lets .m files use `#import "SRCommon.h"` as well as `<ShortcutRecorder/SRCommon.h>`.

@@ -15,6 +15,7 @@ codesign.conf
 codesign.crt
 codesign.key
 codesign.p12
+scripts/codesign/alttab-signing.pass
 /.claude/*
 !/.claude/skills/
 /config/local.xcconfig

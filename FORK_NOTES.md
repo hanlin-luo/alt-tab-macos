@@ -10,16 +10,26 @@
 
 ## 解锁补丁（核心）
 
-文件：`src/pro/license/LicenseManager.swift`，函数 `computeState()` 顶部：
+文件：`src/pro/license/LicenseManager.swift`，函数 `computeState()`：
 
 ```swift
-let forkUnlockPro = true // [FORK-PATCH] unconditional Pro unlock
-if forkUnlockPro { return .pro }
+// [FORK-PATCH] hanlin-luo fork: always report an active Pro license so every
+// Pro feature (search, styles, auto-size, extra shortcuts) is unlocked locally.
+func computeState() -> LicenseState {
+    .pro // [FORK-PATCH] unconditional Pro unlock
+}
 ```
+
+注意：上游原本的 keychain / 试用 / 远端校验逻辑**已被整段删除**（不是加判断早退），
+因为删掉之后的分支会变成 unreachable code，Swift 直接编译报错。合并上游时，
+`computeState()` 必须保持只有 `return .pro` 一行。
 
 效果：许可证状态机永远返回 `.pro` → `isProAvailable = true`、`isProLocked = false`
 → 搜索 / 三种切换器样式 / 自动调整大小 / 9 组快捷键全部可用；
 → 不再出现试用倒计时、Day X 升级提示；不再发起许可证网络验证。
+
+运行时自检：app 会把许可证档位写成 `license=pro` 的 cookie（`syncLicenseCookie`），
+落在 `~/Library/HTTPStorages/com.lwouis.alt-tab-macos.binarycookies` 里。
 
 所有补丁代码都带 `[FORK-PATCH]` 注释，合并上游时用 `grep -rn "FORK-PATCH" src/` 确认补丁还在。
 
@@ -56,7 +66,7 @@ not permitted`，这两个 flag 是唯一有效解法（`-disableAutomaticPackag
 CODE_SIGN_IDENTITY = Local Self-Signed        // scripts/codesign/setup_local.sh 生成的自签名证书
 OTHER_CODE_SIGN_FLAGS = --deep --timestamp=none
 ENABLE_HARDENED_RUNTIME = NO
-CURRENT_PROJECT_VERSION = 11.4.3              // 与上游最新 tag 保持一致
+CURRENT_PROJECT_VERSION = 11.9.2              // 与上游最新 release 保持一致
 ```
 
 两个关键教训（都是实测踩出来的）：
@@ -70,6 +80,73 @@ CURRENT_PROJECT_VERSION = 11.4.3              // 与上游最新 tag 保持一�
    无需手动维护。
 
 要求：Xcode（已在用 26.6）、Swift 5.8 语法、部署目标 macOS 10.13。
+
+## 没有 Xcode 时的编译（Command Line Tools 即可）
+
+有些机器只装了 Command Line Tools，没装完整 Xcode。这时 `xcodebuild` 根本跑不起来
+（`xcode-select: error: tool 'xcodebuild' requires Xcode`），而 `ibtool` / `actool`
+也只有 Xcode 才带。本 fork 为此准备了一条纯 SwiftPM 的构建路径：
+
+```bash
+bash scripts/codesign/setup_local.sh   # 生成自签名证书 + 专用签名钥匙串（只需跑一次）
+bash scripts/build_local.sh            # 编译 → 组装 .app → 签名 → 安装到 /Applications
+bash scripts/build_local.sh --no-install   # 只出产物，不安装
+```
+
+它做的事：
+
+- `Package.swift`（由 `scripts/generate_package_manifest.py` 生成）描述了与 Xcode 工程
+  **同一个 app target**：同样的 232 个 Swift 文件 + 2 个 Objective-C 文件，同样的排除项
+  （单元测试、`*Specs.md`）。依赖仍是 `vendor/` 下那三个本地 SPM 包。
+- `scripts/build_local.sh` 负责 Xcode 工程的那些 build phase 干的事：拷资源、生成
+  `Info.plist`、嵌 `Sparkle.framework` / `CrashReporter.framework`、跑仓库自带的
+  `scripts/copy_sparkle_helpers.sh`、签名。
+- `scripts/generate_info_plist.py` 直接读 `config/base.xcconfig` + `config/release.xcconfig`
+  + `config/local.xcconfig` 做变量替换，和 Xcode 的 Info.plist 处理结果一致。
+
+两处绕不开 Xcode 工具的地方：
+
+1. **Sparkle 的 3 个 xib**：SPM 用 `ibtool` 编译 xib，没有 Xcode 就编不了。改成用官方
+   release tarball 里**已编译好的 .nib**（`vendor/Sparkle/Sources/Sparkle/*.nib`），
+   `vendor/scripts/update_sparkle.sh` 里同步改了，更新 vendor 时不会退回旧状态。
+2. **ShortcutRecorder 的 `Images.xcassets`**：SPM 用 `actool` 编译资源目录，同样没有
+   Xcode 就编不了。分两部分处理：
+   - 图片：把 imageset 里的 PNG 平铺进 `ShortcutRecorder_ShortcutRecorder.bundle/Contents/Resources/`——
+     `-[NSBundle imageForResource:]` 会自动把 `<name>.png` 和 `<name>@2x.png` 配成一张
+     多分辨率 NSImage，ShortcutRecorder 的 `SRImage()` 正是这么找图的，效果一致。
+   - **样式描述（`sr-mojave-info` / `sr-yosemite-info`）是 data asset，不是图片**：
+     `NSDataAsset` 只认**已编译**的资源目录，平铺的 JSON 它看不见。而
+     `SRRecorderControlStyle` 拿不到它就会
+     `raise NSInternalInconsistencyException("Missing sr-mojave-info")`——
+     macOS 26 起 AppKit 把未捕获的 NSException 变成 SIGTRAP，**一点 Settings 就必崩**
+     （Settings 的 Controls 标签页会建 ShortcutRecorder 控件）。所以给
+     `SRRecorderControlStyle.m` 打了个补丁：拿不到编译资源时回退读 dataset 里的
+     `info.json`（也就是编译后本该存的那几个字节），见
+     `vendor/scripts/update_shortcut_recorder.sh` 里的 `patch_sr_style_info_fallback`。
+
+签名有一个坑（实测卡了很久）：**codesign 用钥匙串里的私钥签名时，如果 key 没有设
+partition list，会永远卡在钥匙串授权弹窗上**（securityd 日志：
+`ACL partition mismatch: client apple: ACL ("apple-tool:")` → `displaying keychain prompt`）。
+非交互脚本等不到那个弹窗的答案。`scripts/codesign/setup_local.sh` 因此把证书导入一个
+**专用钥匙串**（`alttab-signing.keychain-db`），并执行：
+
+```bash
+security set-key-partition-list -S apple-tool:,apple: -s -k <钥匙串密码> <钥匙串>
+```
+
+这一步需要钥匙串密码，所以不能放在登录钥匙串里（拿不到它的密码）。
+
+钥匙串密码存在 `scripts/codesign/alttab-signing.pass`（已 gitignore），**和 PKCS#12 容器的密码
+是同一个**，所以容器随时能重新导入。`scripts/build_local.sh` 每次签名前都会用这个密码解锁
+钥匙串，正常情况下**不会弹窗**。
+
+两个别再踩的坑：
+
+- `security set-keychain-settings` **不要加 `-t`（自动锁定超时）也不要加 `-l`（睡眠时锁定）**：
+  加了之后钥匙串会自己锁上，下一次 codesign 就弹出「请输入钥匙串密码」的对话框——
+  登录密码没用（这是独立钥匙串），非交互脚本就永远卡住。`setup_local.sh` 现在不设这两个参数。
+- `security add-trusted-cert` 对**已经信任过的**证书再执行一次，会要求用户授权改动信任设置
+  （又是一个弹窗）。`setup_local.sh` 会先查 `security dump-trust-settings`，已信任就跳过。
 
 ## 安装自编译版注意事项
 

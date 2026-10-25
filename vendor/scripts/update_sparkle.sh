@@ -143,10 +143,13 @@ for src in "${SPARKLE_LIB_SOURCES[@]}"; do
     cp "$TMP/src/$src" "$DEST/Sources/Sparkle/"
 done
 
-# 3. Copy the 3 xibs (compiled to .nib at SPM build time).
-cp "$TMP/src/Sparkle/SUStatus.xib"                   "$DEST/Sources/Sparkle/"
-cp "$TMP/src/Sparkle/SUUpdateAlert.xib"              "$DEST/Sources/Sparkle/"
-cp "$TMP/src/Sparkle/SUUpdatePermissionPrompt.xib"   "$DEST/Sources/Sparkle/"
+# 3. Copy the 3 pre-compiled nibs from the release tarball's framework. The upstream .xib sources
+#    can't be compiled here: SPM would need ibtool, which only ships with Xcode, so a
+#    Command Line Tools-only build would fail. The nibs in the tarball are exactly what ibtool
+#    produced for this release.
+cp "$PREBUILT_FW/Versions/B/Resources/SUStatus.nib"                   "$DEST/Sources/Sparkle/"
+cp "$PREBUILT_FW/Versions/B/Resources/SUUpdateAlert.nib"              "$DEST/Sources/Sparkle/"
+cp -R "$PREBUILT_FW/Versions/B/Resources/SUUpdatePermissionPrompt.nib" "$DEST/Sources/Sparkle/"
 
 # 4. Copy lprojs we ship + Base.lproj.
 cp -R "$TMP/src/Sparkle/Base.lproj" "$DEST/Sources/Sparkle/"
@@ -211,9 +214,13 @@ let package = Package(
             name: "Sparkle",
             path: "Sources/Sparkle",
             resources: [
-                .process("SUStatus.xib"),
-                .process("SUUpdateAlert.xib"),
-                .process("SUUpdatePermissionPrompt.xib"),
+                // Pre-compiled nibs, not the upstream .xibs. SPM compiles .xib with ibtool, which
+                // only ships with Xcode — a Command Line Tools-only build cannot run it. The nibs
+                // come from the matching upstream release tarball (see vendor/scripts/update_sparkle.sh),
+                // so they are byte-identical to what ibtool would have produced.
+                .copy("SUStatus.nib"),
+                .copy("SUUpdateAlert.nib"),
+                .copy("SUUpdatePermissionPrompt.nib"),
                 .process("ReleaseNotesColorStyle.css"),
             ],
             publicHeadersPath: "include",

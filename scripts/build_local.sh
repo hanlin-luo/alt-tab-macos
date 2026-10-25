@@ -147,7 +147,11 @@ step "Copying resources"
 cp -R "$ROOT/resources/l10n/"*.lproj "$RESOURCES/"
 cp "$ROOT/resources/icons/app/app.png" "$RESOURCES/"
 cp "$ROOT/resources/icons/menubar/"*.pdf "$RESOURCES/"
-cp "$ROOT/resources/illustrations/"*.heic "$RESOURCES/"
+# The Xcode project ships native-illustrations as a folder reference: LocalizedIllustration loads
+# scenes.plist with subdirectory "native-illustrations", so the directory itself must land in
+# Resources, not its contents.
+cp -R "$ROOT/resources/native-illustrations" "$RESOURCES/native-illustrations"
+cp "$ROOT/resources/pro-rabbit.png" "$RESOURCES/"
 cp "$ROOT/resources/SF-Pro-Text-Regular.otf" "$RESOURCES/"
 cp "$ROOT/docs/acknowledgments.md" "$ROOT/docs/contributors.md" "$RESOURCES/"
 

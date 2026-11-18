@@ -66,7 +66,7 @@ not permitted`，这两个 flag 是唯一有效解法（`-disableAutomaticPackag
 CODE_SIGN_IDENTITY = Local Self-Signed        // scripts/codesign/setup_local.sh 生成的自签名证书
 OTHER_CODE_SIGN_FLAGS = --deep --timestamp=none
 ENABLE_HARDENED_RUNTIME = NO
-CURRENT_PROJECT_VERSION = 11.9.2              // 与上游最新 release 保持一致
+CURRENT_PROJECT_VERSION = 11.10.2             // 与上游最新 release 保持一致
 ```
 
 两个关键教训（都是实测踩出来的）：
